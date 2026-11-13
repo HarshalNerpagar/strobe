@@ -23,6 +23,8 @@ use crate::pipeline_mac::{
 #[cfg(windows)]
 pub use crate::pipeline_win::Warm;
 #[cfg(windows)]
+use crate::pipeline_win::video_memory;
+#[cfg(windows)]
 use crate::pipeline_win::{
     Converting, ConvertingSpec, Frame, Keep, POOL_MARGIN, Started, Submit, start, turbo_default,
 };
@@ -36,6 +38,8 @@ const MIN_RUN: u64 = 80;
 const LEAD_IN_RUNS: u64 = 10;
 const MIN_RUN_LEAD_INS: u64 = 4;
 const TICKING_TIMEOUT: Duration = Duration::from_secs(30);
+const FULL_HD_FRAME_BYTES: u64 = 1920 * 1088 * 3 / 2;
+const VIDEO_MEMORY_SHARE: u64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -453,10 +457,32 @@ fn physical_memory() -> Option<u64> {
     None
 }
 
-/// Frame buffers the memory budget holds beyond the pool's margin.
+#[cfg(not(windows))]
+fn video_memory() -> Option<u64> {
+    None
+}
+
+/// Frame buffers the pool budget holds beyond the pool's margin.
 fn allowed(frame_bytes: u64) -> usize {
-    let buffers = (memory_budget() / frame_bytes) as usize;
+    let buffers = (pool_budget(frame_bytes, video_memory()) / frame_bytes) as usize;
     buffers.saturating_sub(POOL_MARGIN).max(WINDOW)
+}
+
+/// The memory budget, and for frames larger than 1080p at most a quarter of the encoder GPU's
+/// dedicated memory, where the encoder's input pool lives beside the views' larger surfaces.
+/// `VRF_MAX_POOL_MB` overrides both.
+fn pool_budget(frame_bytes: u64, video_memory: Option<u64>) -> u64 {
+    if let Some(megabytes) = std::env::var("VRF_MAX_POOL_MB")
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+    {
+        return megabytes << 20;
+    }
+    let budget = memory_budget();
+    match video_memory {
+        Some(bytes) if frame_bytes > FULL_HD_FRAME_BYTES => budget.min(bytes / VIDEO_MEMORY_SHARE),
+        _ => budget,
+    }
 }
 
 /// An eighth of the machine's memory for frames waiting on the encoder, between 1.5 and 3 GB.
@@ -1315,6 +1341,16 @@ mod tests {
         assert!(fitted.views >= 1 && fitted.views < 8);
         let ahead = (fitted.views as u64 - 1) * fitted.run + fitted.views as u64;
         assert!(ahead * frame_bytes <= memory_budget());
+    }
+
+    #[test]
+    fn video_memory_caps_the_pool_only_above_1080p() {
+        let video_memory = Some(8u64 << 30);
+        let full_hd = 1920 * 1080 * 3 / 2;
+        let uhd = 3840 * 2160 * 3 / 2;
+        assert_eq!(pool_budget(full_hd, video_memory), memory_budget());
+        assert_eq!(pool_budget(uhd, None), memory_budget());
+        assert_eq!(pool_budget(uhd, video_memory), memory_budget().min(2 << 30));
     }
 
     #[test]

@@ -52,6 +52,7 @@ pub fn options(project: &Path, composition: &str) -> Options {
         audio: true,
         video: VideoDecoder::Native,
         skip: false,
+        scale: 1.0,
     }
 }
 

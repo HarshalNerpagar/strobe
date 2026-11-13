@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -19,6 +19,13 @@ use crate::driver::{Config, submit_loop};
 use crate::win;
 
 pub const POOL_MARGIN: usize = 32;
+
+static VIDEO_MEMORY: OnceLock<Option<u64>> = OnceLock::new();
+
+/// The dedicated memory of the GPU the encoder runs on, once a [`Warm`] has opened it.
+pub fn video_memory() -> Option<u64> {
+    VIDEO_MEMORY.get().copied().flatten()
+}
 
 fn chunk_frames(width: u32, height: u32) -> u64 {
     if u64::from(width) * u64::from(height) > 1920 * 1088 {
@@ -51,6 +58,7 @@ impl Warm {
             Some(luid) => Gpu::with_luid(luid)?,
             None => Gpu::new()?,
         };
+        let _ = VIDEO_MEMORY.set(gpu.video_memory());
         let converter = Converter::new(&gpu, Format::Nv12);
         Ok(Warm {
             gpu,

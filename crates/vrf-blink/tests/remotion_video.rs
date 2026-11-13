@@ -69,6 +69,7 @@ fn options(project: &Path, composition: &str, video: VideoDecoder) -> Options {
         audio: true,
         video,
         skip: false,
+        scale: 1.0,
     }
 }
 

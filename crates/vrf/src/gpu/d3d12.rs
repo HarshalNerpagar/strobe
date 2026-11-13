@@ -148,6 +148,13 @@ impl Gpu {
         adapter_luid(&self.adapter).expect("a D3D12 adapter has a LUID")
     }
 
+    /// The adapter's dedicated video memory in bytes.
+    pub fn video_memory(&self) -> Option<u64> {
+        let hal = unsafe { self.adapter.as_hal::<Dx12>() }?;
+        let desc = unsafe { hal.as_raw().GetDesc() }.ok()?;
+        Some(desc.DedicatedVideoMemory as u64)
+    }
+
     /// Opens the shared handle on this device and wraps the resource as a
     /// texture without copying it. The texture is in the COMMON state and CEF
     /// owns the contents: copy out of it before the next begin frame, then

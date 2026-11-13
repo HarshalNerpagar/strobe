@@ -74,6 +74,11 @@ struct RenderArgs {
     /// Remotion: input props as JSON, or the path of a JSON file.
     #[arg(long)]
     props: Option<String>,
+    /// Remotion: device pixels per CSS pixel, as Remotion's `--scale`. The composition keeps its
+    /// layout size and the video is this many times larger, each side rounded to even: 1.3333
+    /// turns 1920x1080 into 2560x1440 and 2 into 3840x2160. 1 if absent.
+    #[arg(long, value_parser = parse_scale)]
+    scale: Option<f64>,
     /// Remotion: milliseconds before a `delayRender` that is never cleared fails the frame.
     /// 30000 if absent.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -173,6 +178,14 @@ fn parse_frames(text: &str) -> Result<RangeInclusive<u64>, String> {
     Ok(first..=last)
 }
 
+fn parse_scale(text: &str) -> Result<f64, String> {
+    let scale: f64 = text.parse().map_err(|e| format!("{text:?}: {e}"))?;
+    if !(scale.is_finite() && scale > 0.0 && scale <= 4.0) {
+        return Err(format!("scale {scale} is not above 0 and at most 4"));
+    }
+    Ok(scale)
+}
+
 fn props(argument: Option<String>) -> Result<Option<String>> {
     match argument {
         Some(text) if !text.trim_start().starts_with('{') => {
@@ -220,7 +233,7 @@ impl RenderArgs {
         let (framework, given, other) = if self.is_remotion() {
             (
                 "Remotion",
-                [
+                vec![
                     ("--fps", self.fps.is_some()),
                     ("--hyperframes", self.hyperframes.is_some()),
                 ],
@@ -229,9 +242,10 @@ impl RenderArgs {
         } else {
             (
                 "HyperFrames",
-                [
+                vec![
                     ("--props", self.props.is_some()),
                     ("--timeout", self.timeout.is_some()),
+                    ("--scale", self.scale.is_some()),
                 ],
                 "Remotion",
             )
@@ -291,6 +305,7 @@ impl RenderArgs {
                     VideoArg::Remotion => VideoDecoder::Remotion,
                 },
                 skip: !self.no_skip,
+                scale: self.scale.unwrap_or(1.0),
             };
             Work::Remotion(RenderJob {
                 options,
@@ -363,8 +378,8 @@ impl From<remotion::Report> for Rendered {
         Rendered {
             report: serde_json::to_value(&report).expect("a report serialises"),
             frames: report.frames,
-            width: report.composition.width,
-            height: report.composition.height,
+            width: report.output_width,
+            height: report.output_height,
             first_frame_ms: report.first_frame_ms,
             total_ms: report.total_ms,
         }
@@ -662,6 +677,27 @@ mod tests {
         }
         let both = check(&hyperframes, &["--props", "{}", "--timeout", "5"]).unwrap_err();
         assert!(both.contains("--props and --timeout"), "{both}");
+    }
+
+    #[test]
+    fn a_scale_is_above_zero_and_at_most_four_and_for_remotion_only() {
+        for scale in ["0", "-1", "4.5", "nan", "inf", "x"] {
+            let argv = ["strobe", "render", "p", "-o", "o.mp4", "--scale", scale];
+            assert!(Cli::try_parse_from(argv).is_err(), "--scale {scale}");
+        }
+        let remotion = project(
+            "remotion-scale",
+            Some(r#"{"dependencies":{"remotion":"4.0.0"}}"#),
+        );
+        let args = render_args(&remotion, &["--scale", "1.3333"]);
+        assert_eq!(args.scale, Some(1.3333));
+        assert!(args.check_framework_flags().is_ok());
+        let hyperframes = project("hyperframes-scale", None);
+        let message = render_args(&hyperframes, &["--scale", "2"])
+            .check_framework_flags()
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("--scale"), "{message}");
     }
 
     #[test]

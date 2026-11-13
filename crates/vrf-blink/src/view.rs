@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -81,10 +81,35 @@ pub struct Paint {
 
 unsafe impl Send for Paint {}
 
-#[derive(Default)]
 struct Size {
     width: AtomicI32,
     height: AtomicI32,
+    scale: AtomicU32,
+}
+
+impl Size {
+    fn new(width: i32, height: i32, scale: f32) -> Size {
+        Size {
+            width: AtomicI32::new(width),
+            height: AtomicI32::new(height),
+            scale: AtomicU32::new(scale.to_bits()),
+        }
+    }
+
+    fn scale(&self) -> f32 {
+        f32::from_bits(self.scale.load(Ordering::Relaxed))
+    }
+
+    fn pixels(&self) -> (u32, u32) {
+        let scale = self.scale();
+        let side = |dips: &AtomicI32| (dips.load(Ordering::Relaxed) as f32 * scale).round() as u32;
+        (side(&self.width), side(&self.height))
+    }
+
+    fn tick_area(&self) -> i64 {
+        let side = self.scale().ceil().max(1.0) as i64;
+        side * side
+    }
 }
 
 struct MethodResult {
@@ -127,7 +152,7 @@ wrap_render_handler! {
         ) -> ::std::os::raw::c_int {
             match screen_info {
                 Some(info) => {
-                    info.device_scale_factor = 1.0;
+                    info.device_scale_factor = self.size.scale();
                     true as _
                 }
                 None => false as _,
@@ -204,7 +229,7 @@ wrap_render_handler! {
                 tick_only: info.extra.has_capture_update_rect != 0
                     && i64::from(info.extra.capture_update_rect.width)
                         * i64::from(info.extra.capture_update_rect.height)
-                        <= 1,
+                        <= self.size.tick_area(),
                 at,
                 _lease: None,
             });
@@ -334,7 +359,7 @@ pub struct View {
 
 impl View {
     pub fn open(ui: &Ui, url: &str, width: i32, height: i32) -> Result<View> {
-        let view = View::launch(ui, url, width, height, None, None)?;
+        let view = View::launch(ui, url, (width, height, 1.0), None, None)?;
         view.settle()?;
         Ok(view)
     }
@@ -351,7 +376,22 @@ impl View {
         height: i32,
         init_script: Option<&str>,
     ) -> Result<View> {
-        let view = View::launch_project(ui, project, entry, width, height, init_script)?;
+        View::open_project_scaled(ui, project, entry, width, height, 1.0, init_script)
+    }
+
+    /// Like [`View::open_project`], laid out at `width` x `height` CSS pixels and rasterised at
+    /// `scale` device pixels per CSS pixel, so deliveries are `scale` times larger.
+    pub fn open_project_scaled(
+        ui: &Ui,
+        project: &Project,
+        entry: &str,
+        width: i32,
+        height: i32,
+        scale: f32,
+        init_script: Option<&str>,
+    ) -> Result<View> {
+        let view =
+            View::launch_project_scaled(ui, project, entry, width, height, scale, init_script)?;
         view.settle()?;
         Ok(view)
     }
@@ -366,11 +406,23 @@ impl View {
         height: i32,
         init_script: Option<&str>,
     ) -> Result<View> {
+        View::launch_project_scaled(ui, project, entry, width, height, 1.0, init_script)
+    }
+
+    /// Like [`View::launch_project`], at `scale` device pixels per CSS pixel.
+    pub fn launch_project_scaled(
+        ui: &Ui,
+        project: &Project,
+        entry: &str,
+        width: i32,
+        height: i32,
+        scale: f32,
+        init_script: Option<&str>,
+    ) -> Result<View> {
         let view = View::launch(
             ui,
             &project.url(entry),
-            width,
-            height,
+            (width, height, scale),
             Some(project.clone()),
             init_script,
         )?;
@@ -392,8 +444,7 @@ impl View {
     fn launch(
         ui: &Ui,
         url: &str,
-        width: i32,
-        height: i32,
+        (width, height, scale): (i32, i32, f32),
         project: Option<Project>,
         init_script: Option<&str>,
     ) -> Result<View> {
@@ -411,10 +462,7 @@ impl View {
         };
         let target = url.to_owned();
         let init_script = init_script.map(|script| format!("{TICK_JS}\n{script}"));
-        let size = Arc::new(Size {
-            width: AtomicI32::new(width),
-            height: AtomicI32::new(height),
-        });
+        let size = Arc::new(Size::new(width, height, scale));
         let bound = project.clone();
         let render_size = size.clone();
         let init = init_script.clone();
@@ -504,10 +552,7 @@ impl View {
     /// `SETTLE_CLEAN` in a row give exactly one delivery at the view's size. A begin frame that
     /// gets no delivery in time adds a round, since its delivery may still arrive.
     pub fn settle(&self) -> Result<()> {
-        let (width, height) = (
-            self.size.width.load(Ordering::Relaxed) as u32,
-            self.size.height.load(Ordering::Relaxed) as u32,
-        );
+        let (width, height) = self.size.pixels();
         let started = Instant::now();
         let (mut clean, mut missed, mut rounds) = (0, 0, 0);
         while started.elapsed() < LOAD_TIMEOUT {
@@ -542,8 +587,14 @@ impl View {
     /// size until the first frame at the new one. A resize without the screen info notice leaves
     /// every later delivery one begin frame behind the page.
     pub fn resize(&self, width: i32, height: i32) {
+        self.resize_scaled(width, height, self.scale());
+    }
+
+    /// Like [`View::resize`], and changes the device pixels per CSS pixel to `scale`.
+    pub fn resize_scaled(&self, width: i32, height: i32, scale: f32) {
         self.size.width.store(width, Ordering::Relaxed);
         self.size.height.store(height, Ordering::Relaxed);
+        self.size.scale.store(scale.to_bits(), Ordering::Relaxed);
         self.resized.set(true);
         let host = self.host.clone();
         self.ui.post(move || {
@@ -560,6 +611,11 @@ impl View {
 
     pub(crate) fn pusher(&self) -> Pusher {
         Pusher::new(self.ui.clone(), self.host.clone())
+    }
+
+    /// Device pixels per CSS pixel.
+    pub fn scale(&self) -> f32 {
+        self.size.scale()
     }
 
     /// Distinguishes views, so a driver can tell that the page it was capturing was replaced.
