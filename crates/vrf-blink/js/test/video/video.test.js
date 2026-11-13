@@ -116,6 +116,12 @@ const fetchUrl = async (src, time) => {
   return URL.createObjectURL(blob);
 };
 
+const fetchUrlFromBytes = async (src, time) => {
+  const res = await globalThis.__vrf.video.request(src, time);
+  const blob = new Blob([await res.arrayBuffer()], { type: res.headers.get('Content-Type') ?? '' });
+  return URL.createObjectURL(blob);
+};
+
 const showImage = (images, src) => {
   const img = { src, className: '', style: { cssText: '' }, parentNode: { insertBefore() {} } };
   images.splice(0, images.length, img);
@@ -175,4 +181,43 @@ test('the decoded frame cache of a clip stays bounded when frames are requested 
     const clip = [...video.clips.values()].at(-1);
     assert.ok(clip.frames.size <= 15, `${clip.frames.size}`);
   });
+});
+
+test('a frame read as bytes and wrapped in a new Blob, as Remotion 4.0.540 and later do, is shown', async () => {
+  await withVideoPage(async (images) => {
+    const video = globalThis.__vrf.video;
+    const url = await fetchUrlFromBytes('clip-f.mp4', 4);
+    assert.equal(video.sources.get(url)?.k, 4);
+    showImage(images, url);
+    assert.equal(video.present(), 1);
+  });
+});
+
+test('each request read as bytes keeps its own frame', async () => {
+  await withVideoPage(async () => {
+    const video = globalThis.__vrf.video;
+    const first = await fetchUrlFromBytes('clip-g.mp4', 2);
+    const second = await fetchUrlFromBytes('clip-g.mp4', 6);
+    assert.equal(video.sources.get(first)?.k, 2);
+    assert.equal(video.sources.get(second)?.k, 6);
+  });
+});
+
+test('the frame response says it carries a PNG', async () => {
+  await withVideoPage(async () => {
+    const res = await globalThis.__vrf.video.request('clip-h.mp4', 1);
+    assert.equal(res.headers.get('Content-Type'), 'image/png');
+  });
+});
+
+test('blobs the page builds itself are untouched and still Blobs', async () => {
+  const blob = new Blob([new Uint8Array([9, 8, 7]).buffer], { type: 'text/plain' });
+  assert.ok(blob instanceof Blob);
+  assert.equal(blob.size, 3);
+  assert.equal(await blob.text(), '\t\b\u0007');
+  class Named extends Blob {}
+  assert.ok(new Named(['x']) instanceof Named);
+  const url = URL.createObjectURL(blob);
+  assert.equal(globalThis.__vrf.video.sources.has(url), false);
+  URL.revokeObjectURL(url);
 });

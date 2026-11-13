@@ -267,6 +267,15 @@
   const nativeCreateObjectURL = URL.createObjectURL.bind(URL);
   const nativeRevokeObjectURL = URL.revokeObjectURL.bind(URL);
   const tagged = new WeakMap();
+  const taggedBuffers = new WeakMap();
+  globalThis.Blob = new Proxy(globalThis.Blob, {
+    construct(target, args, newTarget) {
+      const blob = Reflect.construct(target, args, newTarget === globalThis.Blob ? target : newTarget);
+      const parts = args[0];
+      if (Array.isArray(parts) && parts.length === 1 && taggedBuffers.has(parts[0])) tagged.set(blob, taggedBuffers.get(parts[0]));
+      return blob;
+    },
+  });
   const sources = new Map();
   let presents = 0;
   const shownSources = () => {
@@ -296,11 +305,17 @@
     if (!clip) return null;
     const k = chooseFrame(clip.pts, time * clip.timescale);
     const [picture, bytes] = await Promise.all([frame(clip, k), placeholder()]);
-    const response = new Response(null, { status: 200 });
+    const tag = { clip, k, picture };
+    const response = new Response(null, { status: 200, headers: { 'Content-Type': 'image/png' } });
     response.blob = async () => {
       const blob = new Blob([bytes], { type: 'image/png' });
-      tagged.set(blob, { clip, k, picture });
+      tagged.set(blob, tag);
       return blob;
+    };
+    response.arrayBuffer = async () => {
+      const copy = bytes.slice(0);
+      taggedBuffers.set(copy, tag);
+      return copy;
     };
     return response;
   };
