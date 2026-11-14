@@ -53,6 +53,28 @@
     return target - pts[before] < pts[before + 1] - target ? before : before + 1;
   };
 
+  const chooseFrameAtOrBefore = (pts, ticks) => {
+    const target = ticks + 1e-3;
+    let low = 0;
+    let high = pts.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (pts[mid] <= target) low = mid + 1;
+      else high = mid;
+    }
+    return Math.max(0, low - 1);
+  };
+
+  const AT_OR_BEFORE_SINCE = [4, 0, 506];
+  const frameRule = (version) => {
+    const parts = String(version ?? '').split(/[.-]/).slice(0, 3).map(Number);
+    if (parts.length < 3 || parts.some(Number.isNaN)) return chooseFrame;
+    for (let i = 0; i < 3; i++) {
+      if (parts[i] !== AT_OR_BEFORE_SINCE[i]) return parts[i] > AT_OR_BEFORE_SINCE[i] ? chooseFrameAtOrBefore : chooseFrame;
+    }
+    return chooseFrameAtOrBefore;
+  };
+
   const send = (message) => globalThis.__vrf_video_send(JSON.stringify(message));
 
   let fallbackInfo = null;
@@ -267,6 +289,15 @@
   const nativeCreateObjectURL = URL.createObjectURL.bind(URL);
   const nativeRevokeObjectURL = URL.revokeObjectURL.bind(URL);
   const tagged = new WeakMap();
+  const taggedBuffers = new WeakMap();
+  globalThis.Blob = new Proxy(globalThis.Blob, {
+    construct(target, args, newTarget) {
+      const blob = Reflect.construct(target, args, newTarget === globalThis.Blob ? target : newTarget);
+      const parts = args[0];
+      if (Array.isArray(parts) && parts.length === 1 && taggedBuffers.has(parts[0])) tagged.set(blob, taggedBuffers.get(parts[0]));
+      return blob;
+    },
+  });
   const sources = new Map();
   let presents = 0;
   const shownSources = () => {
@@ -294,13 +325,19 @@
   const request = async (src, time) => {
     const clip = await open(src);
     if (!clip) return null;
-    const k = chooseFrame(clip.pts, time * clip.timescale);
+    const k = frameRule(globalThis.__vrf_rm_config?.remotionVersion)(clip.pts, time * clip.timescale);
     const [picture, bytes] = await Promise.all([frame(clip, k), placeholder()]);
-    const response = new Response(null, { status: 200 });
+    const tag = { clip, k, picture };
+    const response = new Response(null, { status: 200, headers: { 'Content-Type': 'image/png' } });
     response.blob = async () => {
       const blob = new Blob([bytes], { type: 'image/png' });
-      tagged.set(blob, { clip, k, picture });
+      tagged.set(blob, tag);
       return blob;
+    };
+    response.arrayBuffer = async () => {
+      const copy = bytes.slice(0);
+      taggedBuffers.set(copy, tag);
+      return copy;
     };
     return response;
   };
@@ -342,6 +379,8 @@
     fallback: () => fallbackInfo,
     refusal: () => lastRefusal,
     chooseFrame,
+    chooseFrameAtOrBefore,
+    frameRule,
     swsRgb,
     swsConfig,
     frame,
