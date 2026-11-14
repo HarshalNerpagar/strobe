@@ -69,6 +69,13 @@ impl Warm {
         })
     }
 
+    /// Copies a delivered paint out of its IOSurface: its bytes, row width and format.
+    pub fn read_paint(&self, paint: &Paint) -> Result<(Vec<u8>, u32, wgpu::TextureFormat)> {
+        let texture = self.gpu.import_iosurface(&paint.surface, 0, paint.format)?;
+        let bytes = self.gpu.read_texture(&texture)?;
+        Ok((bytes, texture.width(), texture.format()))
+    }
+
     /// Allocates the pixel pool for frames of `width` x `height` if no render has yet.
     pub fn prepare(&mut self, width: u32, height: u32, colour: ColourSpace) -> Result<()> {
         let mut config = Config::new(width, height, Rational::new(30, 1), Codec::H264, 0);

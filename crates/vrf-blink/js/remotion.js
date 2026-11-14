@@ -228,6 +228,20 @@ globalThis.process.env.NODE_ENV = 'production';
     return { ...meta, webgl: sawWebgl };
   };
 
+  const reprops = async (props) => {
+    if (compositionId === null) throw new Error('reprops() needs a mounted composition');
+    await queue.catch(() => {});
+    config.inputProps = props;
+    window.remotion_inputProps = props;
+    window.remotion_setBundleMode({ type: 'evaluation' });
+    await waitReady(null);
+    resolved = await window.remotion_calculateComposition(compositionId);
+    resolving = compositionId;
+    await mount();
+    const { width, height, fps, durationInFrames, defaultCodec } = resolved;
+    return { id: compositionId, width, height, fps, durationInFrames, defaultCodec, webgl: sawWebgl };
+  };
+
   let sawWebgl = false;
 
   const noteWebgl = (prototype) => {
@@ -293,6 +307,7 @@ globalThis.process.env.NODE_ENV = 'production';
     init,
     resolve,
     mount,
+    reprops,
     seek,
     captureParams: () => CAPTURE[config.captureMode],
   };

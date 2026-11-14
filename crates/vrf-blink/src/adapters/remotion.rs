@@ -29,6 +29,10 @@ use crate::skip::{self, Skip, TRACK_JS};
 use crate::video::{Clips, Link, StartFallback};
 use crate::{Mode, Project, Ui, View};
 
+mod still;
+
+pub use still::{Still, StillJob, StillReport, StillStages};
+
 const VIDEO_JS: &str = include_str!("../../js/video.js");
 const REMOTION_JS: &str = include_str!("../../js/remotion.js");
 const CLOCK_JS: &str = include_str!("../../js/clock.js");
@@ -141,6 +145,10 @@ pub struct Warmth {
     pub gpu: bool,
     pub frame_server: bool,
     pub view: bool,
+    /// Whether a loaded page of the same project took the new props in place instead of a new
+    /// page being loaded.
+    #[serde(default)]
+    pub props_swapped: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +156,8 @@ pub struct Stages {
     pub bundle_s: f64,
     pub bundle_cached: bool,
     pub frame_server_s: f64,
+    #[serde(default)]
+    pub props_s: f64,
     pub open_s: f64,
     pub pipeline_s: f64,
     pub render_s: f64,
@@ -664,6 +674,10 @@ impl Page {
         self
     }
 
+    fn set_props(&mut self, props: Option<&str>) {
+        self.config["inputProps"] = Value::String(props.unwrap_or("{}").to_owned());
+    }
+
     fn script(&self) -> String {
         let video = if self.native.is_some() { VIDEO_JS } else { "" };
         let track = if self.track { TRACK_JS } else { "" };
@@ -821,7 +835,7 @@ fn resolve_references(frames: &mut [FrameAssets]) {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Key {
     project: PathBuf,
     bundle: PathBuf,
@@ -841,7 +855,72 @@ struct Loaded {
     spare: Option<View>,
 }
 
+impl Key {
+    fn same_but_props(&self, other: &Key) -> bool {
+        self.props != other.props
+            && Key {
+                props: other.props.clone(),
+                ..self.clone()
+            } == *other
+    }
+}
+
+/// What a loaded project reports about itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadedProject {
+    pub project: PathBuf,
+    pub bundle: PathBuf,
+    pub composition: String,
+    /// A short hash of the props text, to tell which props a warm page holds.
+    pub props: String,
+    pub size: Option<Composition>,
+    pub spare_view: bool,
+}
+
 impl Loaded {
+    fn swap_props(&mut self, key: &Key) -> Result<()> {
+        self.page.set_props(key.props.as_deref());
+        self.key = key.clone();
+        let (Some(old), Some(mut view)) = (self.composition, self.take_view()) else {
+            self.composition = None;
+            return Ok(());
+        };
+        let props = serde_json::to_string(key.props.as_deref().unwrap_or("{}"))?;
+        let swapped = view
+            .evaluate(&format!("__vrf.rm.reprops({props})"))
+            .context("the composition did not take the new props")
+            .and_then(|meta| Ok(serde_json::from_value::<Composition>(meta)?));
+        match swapped {
+            Ok(new) if (new.width, new.height) == (old.width, old.height) => {
+                self.composition = Some(new);
+                self.spare = Some(view);
+                Ok(())
+            }
+            Ok(_) => {
+                self.composition = None;
+                view.close()
+            }
+            Err(error) => {
+                self.composition = None;
+                let _ = view.close();
+                Err(error)
+            }
+        }
+    }
+
+    fn status(&self) -> LoadedProject {
+        let mut context = digest::Context::new(&digest::SHA256);
+        context.update(self.key.props.as_deref().unwrap_or("{}").as_bytes());
+        LoadedProject {
+            project: self.key.project.clone(),
+            bundle: self.key.bundle.clone(),
+            composition: self.key.composition.clone(),
+            props: short_hex(context),
+            size: self.composition,
+            spare_view: self.spare.is_some(),
+        }
+    }
+
     fn fill(&mut self, ui: &Ui) -> Result<()> {
         let Some(composition) = self.composition else {
             return Ok(());
@@ -875,6 +954,30 @@ pub struct Renderer {
     warm: Option<Warm>,
     loaded: Vec<Loaded>,
     projects: usize,
+    hot_props: bool,
+}
+
+struct Taken {
+    loaded: Loaded,
+    bundle: Bundle,
+    bundle_s: Duration,
+    frame_server_s: Duration,
+    frame_server_warm: bool,
+    props_s: Duration,
+    props_swapped: bool,
+}
+
+/// What [`Renderer::warm`] prepared.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WarmReport {
+    pub composition: Composition,
+    pub bundle_s: f64,
+    pub bundle_cached: bool,
+    pub frame_server_s: f64,
+    pub props_s: f64,
+    pub open_s: f64,
+    pub total_ms: f64,
+    pub warm: Warmth,
 }
 
 impl Renderer {
@@ -884,7 +987,179 @@ impl Renderer {
             warm: None,
             loaded: Vec::new(),
             projects,
+            hot_props: false,
         }
+    }
+
+    /// With `on`, a render whose props differ from a loaded page of the same project and
+    /// composition hands the new props to that page and mounts the composition again, instead of
+    /// loading a new page.
+    pub fn set_hot_props(&mut self, on: bool) {
+        self.hot_props = on;
+    }
+
+    /// The loaded projects, the most recently used last.
+    pub fn loaded(&self) -> Vec<LoadedProject> {
+        self.loaded.iter().map(Loaded::status).collect()
+    }
+
+    fn take(&mut self, options: &Options) -> Result<Taken> {
+        let step = Instant::now();
+        let bundle = bundle(&options.project, options.entry.as_deref())?;
+        if !bundle.cached {
+            let held: Vec<PathBuf> = self
+                .loaded
+                .iter()
+                .map(|loaded| loaded.key.bundle.clone())
+                .chain([bundle.dir.clone()])
+                .collect();
+            prune_bundles(&held);
+        }
+        let bundle_s = step.elapsed();
+
+        let project_dir = crate::canonical(&options.project)?;
+        let key = Key {
+            project: project_dir,
+            bundle: bundle.dir.clone(),
+            composition: options.composition.clone(),
+            props: options.props.clone(),
+            timeout: options.timeout,
+            mode: options.mode,
+            video: options.video,
+            skip: options.skip,
+        };
+        let step = Instant::now();
+        let (kept, props_swapped) = match self.loaded.iter().position(|loaded| loaded.key == key) {
+            Some(at) => (Some(self.loaded.remove(at)), false),
+            None => {
+                let swapped = self.swap_props(&key);
+                let props_swapped = swapped.is_some();
+                (swapped, props_swapped)
+            }
+        };
+        let props_s = if props_swapped {
+            step.elapsed()
+        } else {
+            Duration::ZERO
+        };
+        let frame_server_warm = kept.is_some();
+        let step = Instant::now();
+        let loaded = match kept {
+            Some(loaded) => loaded,
+            None => {
+                let project = Project::open(&bundle.dir, options.mode)?;
+                let frame_server = match options.video {
+                    VideoDecoder::Remotion => Some(Offthread::start(&key.project, &bundle.dir)?),
+                    VideoDecoder::Native => None,
+                };
+                let mut page = Page::new(project.clone(), options, frame_server.as_ref())?;
+                if options.video == VideoDecoder::Native {
+                    let fallback = Fallback::new(&key.project, &bundle.dir, project)?;
+                    page = page.with_native_video(Arc::new(fallback));
+                }
+                Loaded {
+                    key,
+                    _frame_server: frame_server,
+                    page,
+                    composition: None,
+                    spare: None,
+                }
+            }
+        };
+        let frame_server_s = step.elapsed();
+        loaded.page.project.clear_failures();
+        Ok(Taken {
+            loaded,
+            bundle,
+            bundle_s,
+            frame_server_s,
+            frame_server_warm,
+            props_s,
+            props_swapped,
+        })
+    }
+
+    fn swap_props(&mut self, key: &Key) -> Option<Loaded> {
+        if !self.hot_props {
+            return None;
+        }
+        let at = self
+            .loaded
+            .iter()
+            .position(|loaded| loaded.key.same_but_props(key))?;
+        let mut loaded = self.loaded.remove(at);
+        match loaded.swap_props(key) {
+            Ok(()) => Some(loaded),
+            Err(error) => {
+                eprintln!(
+                    "strobe: a loaded page did not take the new props, loading a new one: {error:#}"
+                );
+                None
+            }
+        }
+    }
+
+    fn keep(&mut self, loaded: Loaded) {
+        self.loaded.push(loaded);
+        while self.loaded.len() > self.projects {
+            self.loaded.remove(0);
+        }
+    }
+
+    /// Bundles the project, starts what it needs and leaves a mounted view of the composition
+    /// ready, so the next render or still of it starts warm.
+    pub fn warm(
+        &mut self,
+        ui: &Ui,
+        options: &Options,
+        command_start: SystemTime,
+    ) -> Result<WarmReport> {
+        let gpu_task = self.warm.is_none().then(|| thread::spawn(Warm::new));
+        let Taken {
+            mut loaded,
+            bundle,
+            bundle_s,
+            frame_server_s,
+            frame_server_warm,
+            props_s,
+            props_swapped,
+        } = self.take(options)?;
+        let step = Instant::now();
+        let view_warm = loaded.composition.is_some() && loaded.spare.is_some();
+        let composition = match loaded.composition {
+            Some(composition) => {
+                loaded.fill(ui)?;
+                composition
+            }
+            None => {
+                let (mut view, composition) = loaded.page.open_unmounted(ui)?;
+                Page::fit(&mut view, &composition)?;
+                loaded.composition = Some(composition);
+                loaded.spare = Some(view);
+                composition
+            }
+        };
+        let open_s = step.elapsed();
+        let gpu_warm = gpu_task.is_none();
+        if let Some(task) = gpu_task {
+            self.warm = Some(task.join().map_err(|_| anyhow!("GPU setup panicked"))??);
+        }
+        self.keep(loaded);
+        Ok(WarmReport {
+            composition,
+            bundle_s: bundle_s.as_secs_f64(),
+            bundle_cached: bundle.cached,
+            frame_server_s: frame_server_s.as_secs_f64(),
+            props_s: props_s.as_secs_f64(),
+            open_s: open_s.as_secs_f64(),
+            total_ms: since(command_start),
+            warm: Warmth {
+                gpu: gpu_warm,
+                frame_server: frame_server_warm,
+                view: view_warm,
+                props_swapped,
+            },
+        })
     }
 
     /// Creates the GPU state and a 1080p pixel pool now rather than in the first render.
@@ -961,61 +1236,15 @@ impl Renderer {
         let started = Instant::now();
         let gpu_task = self.warm.is_none().then(|| thread::spawn(Warm::new));
 
-        let step = Instant::now();
-        let bundle = bundle(&options.project, options.entry.as_deref())?;
-        if !bundle.cached {
-            let held: Vec<PathBuf> = self
-                .loaded
-                .iter()
-                .map(|loaded| loaded.key.bundle.clone())
-                .chain([bundle.dir.clone()])
-                .collect();
-            prune_bundles(&held);
-        }
-        let bundle_s = step.elapsed();
-
-        let project_dir = crate::canonical(&options.project)?;
-        let key = Key {
-            project: project_dir,
-            bundle: bundle.dir.clone(),
-            composition: options.composition.clone(),
-            props: options.props.clone(),
-            timeout: options.timeout,
-            mode: options.mode,
-            video: options.video,
-            skip: options.skip,
-        };
-        let kept = self
-            .loaded
-            .iter()
-            .position(|loaded| loaded.key == key)
-            .map(|at| self.loaded.remove(at));
-        let frame_server_warm = kept.is_some();
-        let step = Instant::now();
-        let mut loaded = match kept {
-            Some(loaded) => loaded,
-            None => {
-                let project = Project::open(&bundle.dir, options.mode)?;
-                let frame_server = match options.video {
-                    VideoDecoder::Remotion => Some(Offthread::start(&key.project, &bundle.dir)?),
-                    VideoDecoder::Native => None,
-                };
-                let mut page = Page::new(project.clone(), options, frame_server.as_ref())?;
-                if options.video == VideoDecoder::Native {
-                    let fallback = Fallback::new(&key.project, &bundle.dir, project)?;
-                    page = page.with_native_video(Arc::new(fallback));
-                }
-                Loaded {
-                    key,
-                    _frame_server: frame_server,
-                    page,
-                    composition: None,
-                    spare: None,
-                }
-            }
-        };
-        let frame_server_s = step.elapsed();
-        loaded.page.project.clear_failures();
+        let Taken {
+            mut loaded,
+            bundle,
+            bundle_s,
+            frame_server_s,
+            frame_server_warm,
+            props_s,
+            props_swapped,
+        } = self.take(options)?;
 
         let open_started = Instant::now();
         let (composition, ready) = match (loaded.composition, loaded.take_view()) {
@@ -1167,10 +1396,7 @@ impl Renderer {
         muxer.finish()?;
         let finish_s = step.elapsed();
 
-        self.loaded.push(loaded);
-        while self.loaded.len() > self.projects {
-            self.loaded.remove(0);
-        }
+        self.keep(loaded);
 
         let elapsed = started.elapsed();
         let (setup_ms, open_s) = first_ready.get().copied().unwrap_or_default();
@@ -1191,6 +1417,7 @@ impl Renderer {
                 bundle_s: bundle_s.as_secs_f64(),
                 bundle_cached: bundle.cached,
                 frame_server_s: frame_server_s.as_secs_f64(),
+                props_s: props_s.as_secs_f64(),
                 open_s: open_s.as_secs_f64(),
                 pipeline_s: stats.pipeline.as_secs_f64(),
                 render_s: render_s.as_secs_f64(),
@@ -1200,6 +1427,7 @@ impl Renderer {
                     gpu: gpu_warm,
                     frame_server: frame_server_warm,
                     view: view_warm,
+                    props_swapped,
                 },
             },
             per_frame: PerFrame {

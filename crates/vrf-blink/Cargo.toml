@@ -8,6 +8,7 @@ license.workspace = true
 vrf = { path = "../vrf" }
 vrf-encode = { path = "../vrf-encode" }
 anyhow = "1.0.104"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 libc = "0.2"
 cef = { version = "156.2.0", default-features = false }
 percent-encoding = "2.3.2"

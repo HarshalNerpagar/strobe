@@ -6,8 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde_json::{Value, json};
 use vrf_blink::adapters::hyperframes;
-use vrf_blink::adapters::remotion::{self, Options, RenderJob, Renderer, VideoDecoder};
+use vrf_blink::adapters::remotion::{self, Options, RenderJob, Renderer, StillJob, VideoDecoder};
 use vrf_blink::daemon::{self, Job, Reply, Request, Stream};
 use vrf_blink::driver::{self, Plan};
 use vrf_blink::{Mode, Ui, calibration};
@@ -17,6 +18,7 @@ const COMMAND_START: &str = "VRF_COMMAND_START_US";
 const SOFTWARE_WEBGL: &str = "VRF_SOFTWARE_WEBGL";
 const DEFAULT_FPS: u32 = 30;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const REMOTION_CPU_RASTER: bool = cfg!(windows);
 
 #[derive(Parser)]
 #[command(name = "strobe", version)]
@@ -34,6 +36,16 @@ enum Command {
     /// WebGL on SwiftShader are fixed for a running CEF, so each has a daemon of its own. With
     /// one running, a render that needs another starts it and waits for it.
     Daemon(DaemonArgs),
+    /// Write single frames of a Remotion composition as PNG or JPEG images, through the same
+    /// page, seek and paint as a render, without encoding a video. Uses a running daemon of the
+    /// same mode like `strobe render`.
+    Still(StillArgs),
+    /// Load a Remotion project in a daemon and leave a ready view of the composition, so the
+    /// next render or still of it starts warm. Starts a daemon of the mode the project renders
+    /// in if none is running.
+    Warm(WarmArgs),
+    /// Print this binary's build id as JSON. A daemon serves only clients of its own build.
+    BuildId,
 }
 
 #[derive(Args, Clone)]
@@ -119,15 +131,126 @@ struct DaemonArgs {
     #[arg(long, default_value_t = 600)]
     idle_timeout: u64,
     /// The rasterisation this daemon renders with. A render in the other mode gets a daemon of
-    /// its own.
-    #[arg(long, value_enum, default_value = "fast")]
-    mode: ModeArg,
+    /// its own. If absent, the mode a Remotion render takes by default on this platform:
+    /// `reference` on Windows, `fast` elsewhere.
+    #[arg(long, value_enum)]
+    mode: Option<ModeArg>,
     /// Projects whose bundle, frame server and views stay loaded.
     #[arg(long, default_value_t = 2)]
     projects: usize,
     /// Stop every running daemon after its current renders.
     #[arg(long)]
     stop: bool,
+    /// Print every running daemon's build, mode, loaded projects and uptime as JSON, and exit.
+    #[arg(long)]
+    status: bool,
+    /// A Remotion render whose props differ from a loaded page of the same composition gives
+    /// the page the new props and mounts the composition again, instead of loading a new page.
+    #[arg(long)]
+    hot_props: bool,
+}
+
+impl DaemonArgs {
+    fn cpu_raster(&self) -> bool {
+        self.mode
+            .map_or(REMOTION_CPU_RASTER, |mode| mode == ModeArg::Reference)
+    }
+}
+
+/// The flags that choose a Remotion page, shared by `still` and `warm` so that both find the
+/// page a render with the same flags loaded.
+#[derive(Args, Clone)]
+struct PageArgs {
+    /// The Remotion project directory, with its dependencies installed.
+    project: PathBuf,
+    /// The composition.
+    #[arg(long)]
+    composition: String,
+    /// Input props as JSON, or the path of a JSON file.
+    #[arg(long)]
+    props: Option<String>,
+    /// As for `strobe render`. If absent, `reference` on Windows and `fast` elsewhere.
+    #[arg(long, value_enum)]
+    mode: Option<ModeArg>,
+    /// The file that calls `registerRoot`, relative to the project. Found if absent.
+    #[arg(long)]
+    entry: Option<PathBuf>,
+    /// Milliseconds before a `delayRender` that is never cleared fails the frame.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout: Option<u64>,
+    /// Fail on any http(s) request that is not pinned in the project's `vrf.lock.json`.
+    #[arg(long)]
+    offline: bool,
+    /// What decodes embedded video, as for `strobe render`.
+    #[arg(long, value_enum, default_value = "native")]
+    video: VideoArg,
+    /// Load the page without the change tracker, as `strobe render --no-skip` does.
+    #[arg(long)]
+    no_skip: bool,
+    /// Print a JSON report on stdout instead of the summary line.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Clone)]
+struct StillArgs {
+    #[command(flatten)]
+    page: PageArgs,
+    /// The frames to write, as a comma-separated list of frames and `first-last` ranges.
+    #[arg(long, value_parser = parse_frame_list)]
+    frames: FrameList,
+    /// The directory the images go to, as `f<frame>.png` and `f<frame>.jpg`.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Also write a JPEG of this quality (1-100).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100))]
+    jpeg: Option<u8>,
+    /// Write no PNG, only the JPEG.
+    #[arg(long, requires = "jpeg")]
+    no_png: bool,
+    /// Resize the images by this factor, at most 1, after the capture.
+    #[arg(long, default_value_t = 1.0)]
+    scale: f64,
+    /// Capture in this process even if a daemon is running.
+    #[arg(long)]
+    no_daemon: bool,
+}
+
+#[derive(Args, Clone)]
+struct WarmArgs {
+    #[command(flatten)]
+    page: PageArgs,
+    /// For a daemon this command starts: seconds with nothing to do before it exits.
+    #[arg(long)]
+    idle_timeout: Option<u64>,
+    /// For a daemon this command starts: projects that stay loaded.
+    #[arg(long)]
+    projects: Option<usize>,
+    /// For a daemon this command starts: see `strobe daemon --hot-props`.
+    #[arg(long)]
+    hot_props: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FrameList(Vec<u64>);
+
+fn parse_frame_list(text: &str) -> Result<FrameList, String> {
+    let mut frames = Vec::new();
+    for part in text
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let range = parse_frames(part)?;
+        if range.end() - range.start() >= 10_000 {
+            return Err(format!("{part} holds more than 10000 frames"));
+        }
+        frames.extend(range);
+    }
+    if frames.is_empty() {
+        return Err("no frames".to_owned());
+    }
+    Ok(FrameList(frames))
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -211,7 +334,7 @@ impl RenderArgs {
     fn cpu_raster(&self) -> bool {
         match self.mode {
             Some(mode) => mode == ModeArg::Reference,
-            None if self.is_remotion() => cfg!(windows),
+            None if self.is_remotion() => REMOTION_CPU_RASTER,
             None => hyperframes::CPU_RASTER,
         }
     }
@@ -350,7 +473,7 @@ fn command_start() -> SystemTime {
 }
 
 struct Rendered {
-    report: serde_json::Value,
+    report: Value,
     frames: u64,
     width: u32,
     height: u32,
@@ -384,21 +507,30 @@ impl From<hyperframes::Report> for Rendered {
     }
 }
 
+fn mode_name(cpu_raster: bool) -> &'static str {
+    if cpu_raster { "reference" } else { "fast" }
+}
+
 fn start_daemon(cpu_raster: bool, socket: &Path) -> Option<Stream> {
     if !daemon::all_sockets().any(|other| daemon::connect(&other).is_some()) {
         return None;
     }
-    let mode = if cpu_raster { "reference" } else { "fast" };
+    let mode = mode_name(cpu_raster);
     eprintln!(
         "strobe: starting a {mode} daemon beside the running one; this render waits for it, later ones start warm"
     );
+    spawn_daemon(cpu_raster, socket, &[])
+}
+
+fn spawn_daemon(cpu_raster: bool, socket: &Path, extra: &[String]) -> Option<Stream> {
     let mut command = Process::new(std::env::current_exe().ok()?);
-    command.args(["daemon", "--mode", mode]);
+    command.args(["daemon", "--mode", mode_name(cpu_raster)]);
+    command.args(extra);
     if vrf_blink::software_webgl() {
         command.env(SOFTWARE_WEBGL, "1");
     }
     let mut child = daemon::spawn_detached(&mut command).ok()?;
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + DAEMON_START;
     loop {
         if let Some(stream) = daemon::connect(socket) {
             return Some(stream);
@@ -410,17 +542,31 @@ fn start_daemon(cpu_raster: bool, socket: &Path) -> Option<Stream> {
     }
 }
 
+/// How a request was served, for the `daemon` field of a JSON report.
+fn served(cpu_raster: bool, by_daemon: Option<&Path>, reason: Option<&str>) -> Value {
+    json!({
+        "served": by_daemon.is_some(),
+        "build": daemon::build_id().unwrap_or_default(),
+        "mode": mode_name(cpu_raster),
+        "socket": by_daemon,
+        "reason": reason,
+    })
+}
+
 fn render_remote(
     args: &RenderArgs,
     cpu_raster: bool,
     command_start: SystemTime,
+    how: &mut Value,
 ) -> Result<Option<Rendered>> {
     let Some(plan) = calibration::cached_plan(args.views, args.run, args.lead_in)? else {
+        *how = served(cpu_raster, None, Some("no calibration is cached yet"));
         return Ok(None);
     };
     let socket = daemon::socket_path();
     let Some(stream) = daemon::connect(&socket).or_else(|| start_daemon(cpu_raster, &socket))
     else {
+        *how = served(cpu_raster, None, Some("no daemon of this mode is running"));
         return Ok(None);
     };
     let job = match args.work(plan)? {
@@ -435,6 +581,7 @@ fn render_remote(
         &mut |ahead| eprintln!("strobe: waiting for {ahead} render(s) ahead in the daemon"),
         &mut |frame, frames| show(frame, frames),
     )?;
+    *how = served(cpu_raster, Some(socket.as_path()), None);
     Ok(match reply {
         Reply::Rendered(report, _) => Some((*report).into()),
         Reply::RenderedHyperframes(report) => Some((*report).into()),
@@ -442,9 +589,13 @@ fn render_remote(
             eprintln!(
                 "strobe: the daemon refused this render ({reason}); rendering in this process"
             );
+            *how = served(cpu_raster, None, Some(&format!("refused: {reason}")));
             None
         }
-        Reply::Gone | Reply::Pong => None,
+        _ => {
+            *how = served(cpu_raster, None, Some("the daemon went away"));
+            None
+        }
     })
 }
 
@@ -467,11 +618,19 @@ fn render_local(ui: &Ui, args: &RenderArgs, command_start: SystemTime) -> Result
     })
 }
 
-fn print_report(rendered: &Rendered, args: &RenderArgs) {
+fn with_daemon(mut report: Value, how: &Value) -> Value {
+    if let Some(object) = report.as_object_mut() {
+        object.insert("daemon".to_owned(), how.clone());
+    }
+    report
+}
+
+fn print_report(rendered: &Rendered, args: &RenderArgs, how: &Value) {
     if args.json {
+        let report = with_daemon(rendered.report.clone(), how);
         println!(
             "{}",
-            serde_json::to_string_pretty(&rendered.report).expect("a report serialises")
+            serde_json::to_string_pretty(&report).expect("a report serialises")
         );
     } else {
         println!(
@@ -516,12 +675,23 @@ fn render_again_with_software_webgl() -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+fn no_daemon(flag: bool) -> Option<&'static str> {
+    if flag {
+        Some("--no-daemon")
+    } else if std::env::var_os("VRF_NO_DAEMON").is_some() {
+        Some("VRF_NO_DAEMON is set")
+    } else {
+        None
+    }
+}
+
 fn run_render(args: RenderArgs, cpu_raster: bool, command_start: SystemTime) -> Result<()> {
     args.check_framework_flags()?;
-    let remote = if args.no_daemon || std::env::var_os("VRF_NO_DAEMON").is_some() {
+    let mut how = served(cpu_raster, None, no_daemon(args.no_daemon));
+    let remote = if no_daemon(args.no_daemon).is_some() {
         None
     } else {
-        match render_remote(&args, cpu_raster, command_start) {
+        match render_remote(&args, cpu_raster, command_start, &mut how) {
             Err(error) if needs_software_webgl(&error) => {
                 return render_again_with_software_webgl();
             }
@@ -544,7 +714,246 @@ fn run_render(args: RenderArgs, cpu_raster: bool, command_start: SystemTime) -> 
             }
         }
     };
-    print_report(&report, &args);
+    print_report(&report, &args, &how);
+    Ok(())
+}
+
+impl PageArgs {
+    fn render_args(&self, output: PathBuf) -> RenderArgs {
+        RenderArgs {
+            project: self.project.clone(),
+            composition: Some(self.composition.clone()),
+            output,
+            codec: CodecArg::H264,
+            mode: self.mode,
+            frames: None,
+            offline: self.offline,
+            entry: self.entry.clone(),
+            hyperframes: None,
+            fps: None,
+            props: self.props.clone(),
+            timeout: self.timeout,
+            views: None,
+            run: None,
+            lead_in: driver::LEAD_IN,
+            no_audio: false,
+            video: self.video,
+            no_skip: self.no_skip,
+            json: self.json,
+            no_daemon: false,
+            no_turbo: false,
+            encoder_sessions: 1,
+        }
+    }
+
+    fn options(&self) -> Result<Options> {
+        match self.render_args(PathBuf::from("-")).work(Plan::single())? {
+            Work::Remotion(job) => Ok(job.options),
+            Work::Hyperframes(_) => unreachable!("a composition makes it a Remotion project"),
+        }
+    }
+
+    fn cpu_raster(&self) -> bool {
+        self.render_args(PathBuf::from("-")).cpu_raster()
+    }
+
+    fn set_modes(&self) -> bool {
+        let cpu_raster = self.cpu_raster();
+        vrf_blink::set_cpu_raster(cpu_raster);
+        vrf_blink::set_software_webgl(
+            std::env::var_os(SOFTWARE_WEBGL).is_some()
+                || self.render_args(PathBuf::from("-")).remembers_webgl(),
+        );
+        cpu_raster
+    }
+}
+
+fn print_json(value: &Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).expect("a report serialises")
+    );
+}
+
+fn still_job(args: &StillArgs) -> Result<StillJob> {
+    Ok(StillJob {
+        options: args.page.options()?,
+        frames: args.frames.0.clone(),
+        output: std::path::absolute(&args.output)?,
+        png: !args.no_png,
+        jpeg: args.jpeg,
+        scale: args.scale,
+    })
+}
+
+fn still_remote(
+    job: &StillJob,
+    cpu_raster: bool,
+    command_start: SystemTime,
+    how: &mut Value,
+) -> Result<Option<remotion::StillReport>> {
+    let socket = daemon::socket_path();
+    let Some(stream) = daemon::connect(&socket).or_else(|| start_daemon(cpu_raster, &socket))
+    else {
+        *how = served(cpu_raster, None, Some("no daemon of this mode is running"));
+        return Ok(None);
+    };
+    let request = Request::new(cpu_raster, command_start, Job::Still(job.clone()))?;
+    let reply = daemon::call(
+        stream,
+        &request,
+        &mut |ahead| eprintln!("strobe: waiting for {ahead} render(s) ahead in the daemon"),
+        &mut |_, _| {},
+    )?;
+    Ok(match reply {
+        Reply::Still(report) => {
+            *how = served(cpu_raster, Some(socket.as_path()), None);
+            Some(*report)
+        }
+        Reply::Refused(reason) => {
+            eprintln!(
+                "strobe: the daemon refused these stills ({reason}); capturing in this process"
+            );
+            *how = served(cpu_raster, None, Some(&format!("refused: {reason}")));
+            None
+        }
+        _ => {
+            *how = served(cpu_raster, None, Some("the daemon went away"));
+            None
+        }
+    })
+}
+
+fn run_still(args: StillArgs, cpu_raster: bool, command_start: SystemTime) -> Result<()> {
+    let job = still_job(&args)?;
+    let mut how = served(cpu_raster, None, no_daemon(args.no_daemon));
+    let remote = if no_daemon(args.no_daemon).is_some() {
+        None
+    } else {
+        match still_remote(&job, cpu_raster, command_start, &mut how) {
+            Err(error) if needs_software_webgl(&error) => {
+                return render_again_with_software_webgl();
+            }
+            remote => remote?,
+        }
+    };
+    let report = match remote {
+        Some(report) => report,
+        None => {
+            unsafe { std::env::set_var("VRF_NO_DAEMON", "1") };
+            let outcome = vrf_blink::run({
+                let job = job.clone();
+                move |ui| Renderer::new(1).still(&ui, &job, command_start, &mut |_, _| Ok(()))
+            });
+            match outcome {
+                Err(error) if needs_software_webgl(&error) => {
+                    return render_again_with_software_webgl();
+                }
+                outcome => outcome?,
+            }
+        }
+    };
+    if args.page.json {
+        print_json(&with_daemon(serde_json::to_value(&report)?, &how));
+    } else {
+        for still in &report.stills {
+            let path = still.png.as_ref().or(still.jpeg.as_ref());
+            println!(
+                "{}: frame {} {}x{}",
+                path.map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                still.frame,
+                still.width,
+                still.height
+            );
+        }
+        println!(
+            "{} stills in {:.2} s",
+            report.stills.len(),
+            report.total_ms / 1000.0
+        );
+    }
+    Ok(())
+}
+
+const DAEMON_START: Duration = Duration::from_secs(120);
+
+fn run_warm(args: WarmArgs, cpu_raster: bool, command_start: SystemTime) -> Result<()> {
+    let options = args.page.options()?;
+    let socket = daemon::socket_path();
+    let mut started = false;
+    let stream = match daemon::connect(&socket) {
+        Some(stream) => stream,
+        None => {
+            let mut extra = Vec::new();
+            if let Some(idle) = args.idle_timeout {
+                extra.extend(["--idle-timeout".to_owned(), idle.to_string()]);
+            }
+            if let Some(projects) = args.projects {
+                extra.extend(["--projects".to_owned(), projects.to_string()]);
+            }
+            if args.hot_props {
+                extra.push("--hot-props".to_owned());
+            }
+            started = true;
+            spawn_daemon(cpu_raster, &socket, &extra).with_context(|| {
+                format!(
+                    "no {} daemon answered on {} within {} s",
+                    mode_name(cpu_raster),
+                    socket.display(),
+                    DAEMON_START.as_secs()
+                )
+            })?
+        }
+    };
+    let request = Request::new(cpu_raster, command_start, Job::Warm(options))?;
+    let reply = daemon::call(
+        stream,
+        &request,
+        &mut |ahead| eprintln!("strobe: waiting for {ahead} render(s) ahead in the daemon"),
+        &mut |_, _| {},
+    )?;
+    let report = match reply {
+        Reply::Warmed(report) => report,
+        Reply::Refused(reason) => {
+            anyhow::bail!("the daemon on {} refused: {reason}", socket.display())
+        }
+        _ => anyhow::bail!("the daemon on {} went away", socket.display()),
+    };
+    let mut how = served(cpu_raster, Some(socket.as_path()), None);
+    how["started"] = Value::Bool(started);
+    if args.page.json {
+        print_json(&with_daemon(serde_json::to_value(&report)?, &how));
+    } else {
+        println!(
+            "{} warm in a {} daemon ({}x{}, {} frames) after {:.2} s",
+            args.page.composition,
+            mode_name(cpu_raster),
+            report.composition.width,
+            report.composition.height,
+            report.composition.duration_in_frames,
+            report.total_ms / 1000.0
+        );
+    }
+    Ok(())
+}
+
+fn daemon_status() -> Result<()> {
+    let request = Request::new(false, SystemTime::now(), Job::Status)?;
+    let mut daemons = Vec::new();
+    for socket in daemon::all_sockets() {
+        let Some(stream) = daemon::connect(&socket) else {
+            continue;
+        };
+        daemons.push(
+            match daemon::call(stream, &request, &mut |_| {}, &mut |_, _| {}) {
+                Ok(Reply::Status(status)) => serde_json::to_value(&*status)?,
+                Ok(_) => json!({ "socket": socket, "error": "no status in the reply" }),
+                Err(error) => json!({ "socket": socket, "error": format!("{error:#}") }),
+            },
+        );
+    }
+    print_json(&json!({ "client_build": daemon::build_id()?, "daemons": daemons }));
     Ok(())
 }
 
@@ -564,18 +973,35 @@ fn main() -> ExitCode {
             run_render(args, cpu_raster, command_start)
         }
         Command::Daemon(args) if args.stop => stop_daemons(),
+        Command::Daemon(args) if args.status => daemon_status(),
         Command::Daemon(args) => {
             vrf_blink::set_software_webgl(std::env::var_os(SOFTWARE_WEBGL).is_some());
-            let cpu_raster = args.mode == ModeArg::Reference;
+            let cpu_raster = args.cpu_raster();
             vrf_blink::set_cpu_raster(cpu_raster);
             let config = daemon::Config {
                 socket: daemon::socket_path(),
                 idle: Duration::from_secs(args.idle_timeout),
                 cpu_raster,
                 projects: args.projects,
+                hot_props: args.hot_props,
             };
             vrf_blink::run(move |ui| daemon::serve(&ui, &config))
         }
+        Command::Still(args) => {
+            let cpu_raster = args.page.set_modes();
+            run_still(args, cpu_raster, command_start)
+        }
+        Command::Warm(args) => {
+            let cpu_raster = args.page.set_modes();
+            run_warm(args, cpu_raster, command_start)
+        }
+        Command::BuildId => daemon::build_id().map(|build| {
+            print_json(&json!({
+                "build": build,
+                "version": env!("CARGO_PKG_VERSION"),
+                "exe": std::env::current_exe().ok(),
+            }))
+        }),
     };
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -670,6 +1096,92 @@ mod tests {
             let argv = ["strobe", "render", "p", "-o", "o.mp4", flag, "0"];
             assert!(Cli::try_parse_from(argv).is_err(), "{flag} 0");
         }
+    }
+
+    #[test]
+    fn a_frame_list_is_frames_and_ranges() {
+        assert_eq!(
+            parse_frame_list("120,450,900"),
+            Ok(FrameList(vec![120, 450, 900]))
+        );
+        assert_eq!(parse_frame_list("5-7, 9"), Ok(FrameList(vec![5, 6, 7, 9])));
+        assert!(parse_frame_list("").is_err());
+        assert!(parse_frame_list(",").is_err());
+        assert!(parse_frame_list("9-3").is_err());
+        assert!(parse_frame_list("0-20000").is_err());
+    }
+
+    fn daemon_args(extra: &[&str]) -> DaemonArgs {
+        let argv = [&["strobe", "daemon"][..], extra].concat();
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Daemon(args) => args,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_daemon_without_a_mode_serves_a_remotion_render_without_one() {
+        let remotion = project(
+            "remotion-daemon",
+            Some(r#"{"dependencies":{"remotion":"4.0.0"}}"#),
+        );
+        assert_eq!(
+            daemon_args(&[]).cpu_raster(),
+            render_args(&remotion, &[]).cpu_raster()
+        );
+        assert!(!daemon_args(&["--mode", "fast"]).cpu_raster());
+        assert!(daemon_args(&["--mode", "reference"]).cpu_raster());
+        assert!(daemon_args(&["--status"]).status);
+        assert!(daemon_args(&["--hot-props"]).hot_props);
+    }
+
+    fn still_args(project: &Path, extra: &[&str]) -> Result<StillArgs, clap::Error> {
+        let argv = [
+            &[
+                "strobe",
+                "still",
+                project.to_str().unwrap(),
+                "--composition",
+                "C",
+                "-o",
+                "stills",
+            ][..],
+            extra,
+        ]
+        .concat();
+        Cli::try_parse_from(argv).map(|cli| match cli.command {
+            Command::Still(args) => args,
+            _ => unreachable!(),
+        })
+    }
+
+    #[test]
+    fn a_still_chooses_its_page_and_mode_as_a_render_does() {
+        let remotion = project(
+            "remotion-still",
+            Some(r#"{"dependencies":{"remotion":"4.0.0"}}"#),
+        );
+        let args = still_args(&remotion, &["--frames", "1,3-4"]).unwrap();
+        assert_eq!(args.frames, FrameList(vec![1, 3, 4]));
+        assert_eq!(
+            args.page.cpu_raster(),
+            render_args(&remotion, &[]).cpu_raster()
+        );
+        let fast = still_args(&remotion, &["--frames", "1", "--mode", "fast"]).unwrap();
+        assert!(!fast.page.cpu_raster());
+        let render = render_args(&remotion, &["--composition", "C", "--props", "{\"a\":1}"]);
+        let still = still_args(&remotion, &["--frames", "1", "--props", "{\"a\":1}"]).unwrap();
+        let options = |work: Work| match work {
+            Work::Remotion(job) => job.options,
+            Work::Hyperframes(_) => unreachable!(),
+        };
+        assert_eq!(
+            still.page.options().unwrap(),
+            options(render.work(Plan::single()).unwrap())
+        );
+        assert!(still_args(&remotion, &["--frames", "1", "--no-png"]).is_err());
+        assert!(still_args(&remotion, &["--frames", "1", "--jpeg", "0"]).is_err());
+        assert!(still_args(&remotion, &[]).is_err());
     }
 
     #[test]
