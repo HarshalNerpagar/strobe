@@ -35,6 +35,7 @@ fn corpus_raw(ui: &Ui) -> Result<()> {
                 audio: false,
                 video: VideoDecoder::Remotion,
                 skip: false,
+                scale: 1.0,
             };
             let bundle = remotion::bundle(&options.project, options.entry.as_deref())?;
             let server = remotion::Offthread::start(&options.project.canonicalize()?, &bundle.dir)?;

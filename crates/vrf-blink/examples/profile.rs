@@ -134,6 +134,7 @@ fn run(ui: Ui) -> Result<()> {
         audio: false,
         video: VideoDecoder::Remotion,
         skip: false,
+        scale: 1.0,
     };
     let step = Instant::now();
     let bundle = remotion::bundle(&project, None)?;

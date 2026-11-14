@@ -12,7 +12,7 @@ use vrf_blink::adapters::remotion::{self, Options, RenderJob, Renderer, StillJob
 use vrf_blink::daemon::{self, Job, Reply, Request, Stream};
 use vrf_blink::driver::{self, Plan};
 use vrf_blink::{Mode, Ui, calibration};
-use vrf_encode::Codec;
+use vrf_encode::{Codec, ColourSpace, EncodeSettings, Tune};
 
 const COMMAND_START: &str = "VRF_COMMAND_START_US";
 const SOFTWARE_WEBGL: &str = "VRF_SOFTWARE_WEBGL";
@@ -86,6 +86,11 @@ struct RenderArgs {
     /// Remotion: input props as JSON, or the path of a JSON file.
     #[arg(long)]
     props: Option<String>,
+    /// Remotion: device pixels per CSS pixel, as Remotion's `--scale`. The composition keeps its
+    /// layout size and the video is this many times larger, each side rounded to even: 1.3333
+    /// turns 1920x1080 into 2560x1440 and 2 into 3840x2160. 1 if absent.
+    #[arg(long, value_parser = parse_scale)]
+    scale: Option<f64>,
     /// Remotion: milliseconds before a `delayRender` that is never cleared fails the frame.
     /// 30000 if absent.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -123,6 +128,37 @@ struct RenderArgs {
     /// NVENC sessions that share the encoding, a chunk of frames each in turn (Windows only).
     #[arg(long, default_value_t = 1)]
     encoder_sessions: usize,
+    /// Remotion, NVENC: constant quality, 1 (best) to 51. 17 if no rate is given.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=51), conflicts_with = "bitrate")]
+    quality: Option<u8>,
+    /// Remotion, NVENC: variable bitrate with this average, in Mb/s.
+    #[arg(long, value_parser = parse_megabits)]
+    bitrate: Option<u32>,
+    /// Remotion, NVENC: the peak bitrate in Mb/s, of `--bitrate` (twice it if absent) or of
+    /// constant quality (240 for H.264 and none for HEVC and AV1 if absent).
+    #[arg(long, value_parser = parse_megabits)]
+    max_bitrate: Option<u32>,
+    /// Remotion, NVENC: the preset, p1 (fastest, the default) to p7 (best).
+    #[arg(long, value_enum)]
+    preset: Option<PresetArg>,
+    /// Remotion, NVENC: the tuning. `hq` if absent.
+    #[arg(long, value_enum)]
+    tune: Option<TuneArg>,
+    /// Remotion: frames from one keyframe to the next. 240 if absent.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    gop: Option<u32>,
+    /// Remotion, NVENC: consecutive B-frames. 0 if absent.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=4))]
+    bframes: Option<u32>,
+    /// Remotion, NVENC: encode 10-bit, HEVC Main10 or AV1, from P010. Implies `--color bt709`.
+    #[arg(long = "10bit")]
+    ten_bit: bool,
+    /// Remotion: the YCbCr matrix and range of the video. `remotion`, the default, is BT.601
+    /// full range for H.264 and HEVC, which gives Remotion's pixels to a player that honours the
+    /// tags, and BT.709 limited for AV1. `bt709` is BT.709 limited range for every codec, what
+    /// broadcast and upload pipelines expect.
+    #[arg(long, value_enum)]
+    color: Option<ColorArg>,
 }
 
 #[derive(Args)]
@@ -260,6 +296,30 @@ enum ModeArg {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum PresetArg {
+    P1,
+    P2,
+    P3,
+    P4,
+    P5,
+    P6,
+    P7,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TuneArg {
+    Hq,
+    Ll,
+    Ull,
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum ColorArg {
+    Remotion,
+    Bt709,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum VideoArg {
     Native,
     Remotion,
@@ -294,6 +354,22 @@ fn parse_frames(text: &str) -> Result<RangeInclusive<u64>, String> {
         return Err(format!("frame {first} is after frame {last}"));
     }
     Ok(first..=last)
+}
+
+fn parse_scale(text: &str) -> Result<f64, String> {
+    let scale: f64 = text.parse().map_err(|e| format!("{text:?}: {e}"))?;
+    if !(scale.is_finite() && scale > 0.0 && scale <= 4.0) {
+        return Err(format!("scale {scale} is not above 0 and at most 4"));
+    }
+    Ok(scale)
+}
+
+fn parse_megabits(text: &str) -> Result<u32, String> {
+    let megabits: f64 = text.parse().map_err(|e| format!("{text:?}: {e}"))?;
+    if !(megabits.is_finite() && megabits > 0.0 && megabits <= 4000.0) {
+        return Err(format!("{megabits} Mb/s is not above 0 and at most 4000"));
+    }
+    Ok((megabits * 1_000_000.0).round() as u32)
 }
 
 fn props(argument: Option<String>) -> Result<Option<String>> {
@@ -343,7 +419,7 @@ impl RenderArgs {
         let (framework, given, other) = if self.is_remotion() {
             (
                 "Remotion",
-                [
+                vec![
                     ("--fps", self.fps.is_some()),
                     ("--hyperframes", self.hyperframes.is_some()),
                 ],
@@ -352,9 +428,19 @@ impl RenderArgs {
         } else {
             (
                 "HyperFrames",
-                [
+                vec![
                     ("--props", self.props.is_some()),
                     ("--timeout", self.timeout.is_some()),
+                    ("--scale", self.scale.is_some()),
+                    ("--quality", self.quality.is_some()),
+                    ("--bitrate", self.bitrate.is_some()),
+                    ("--max-bitrate", self.max_bitrate.is_some()),
+                    ("--preset", self.preset.is_some()),
+                    ("--tune", self.tune.is_some()),
+                    ("--gop", self.gop.is_some()),
+                    ("--bframes", self.bframes.is_some()),
+                    ("--10bit", self.ten_bit),
+                    ("--color", self.color.is_some()),
                 ],
                 "Remotion",
             )
@@ -370,6 +456,44 @@ impl RenderArgs {
             self.project.display()
         );
         Ok(())
+    }
+
+    fn encode(&self) -> Result<EncodeSettings> {
+        let codec = Codec::from(self.codec);
+        if self.ten_bit {
+            ensure!(
+                matches!(codec, Codec::Hevc | Codec::Av1),
+                "--10bit needs --codec hevc or av1"
+            );
+            ensure!(
+                cfg!(windows),
+                "--10bit is NVENC only, and NVENC is Windows only"
+            );
+            ensure!(
+                self.color != Some(ColorArg::Remotion) || codec == Codec::Av1,
+                "--10bit converts to BT.709 limited range and cannot keep --color remotion"
+            );
+        }
+        let colour = match self.color {
+            Some(ColorArg::Bt709) => Some(ColourSpace::BT709),
+            None if self.ten_bit => Some(ColourSpace::BT709),
+            Some(ColorArg::Remotion) | None => None,
+        };
+        Ok(EncodeSettings {
+            constant_quality: self.quality,
+            bit_rate: self.bitrate,
+            max_bit_rate: self.max_bitrate,
+            preset: self.preset.map(|preset| preset as u8 + 1),
+            tune: self.tune.map(|tune| match tune {
+                TuneArg::Hq => Tune::HighQuality,
+                TuneArg::Ll => Tune::LowLatency,
+                TuneArg::Ull => Tune::UltraLowLatency,
+            }),
+            gop: self.gop,
+            b_frames: self.bframes,
+            ten_bit: self.ten_bit,
+            colour,
+        })
     }
 
     fn remembers_webgl(&self) -> bool {
@@ -414,12 +538,14 @@ impl RenderArgs {
                     VideoArg::Remotion => VideoDecoder::Remotion,
                 },
                 skip: !self.no_skip,
+                scale: self.scale.unwrap_or(1.0),
             };
             Work::Remotion(RenderJob {
                 options,
                 frames: self.frames.clone(),
                 codec: self.codec.into(),
                 output,
+                encode: self.encode()?,
             })
         } else {
             let options = hyperframes::Options {
@@ -486,8 +612,8 @@ impl From<remotion::Report> for Rendered {
         Rendered {
             report: serde_json::to_value(&report).expect("a report serialises"),
             frames: report.frames,
-            width: report.composition.width,
-            height: report.composition.height,
+            width: report.output_width,
+            height: report.output_height,
             first_frame_ms: report.first_frame_ms,
             total_ms: report.total_ms,
         }
@@ -743,6 +869,16 @@ impl PageArgs {
             no_daemon: false,
             no_turbo: false,
             encoder_sessions: 1,
+            scale: None,
+            quality: None,
+            bitrate: None,
+            max_bitrate: None,
+            preset: None,
+            tune: None,
+            gop: None,
+            bframes: None,
+            ten_bit: false,
+            color: None,
         }
     }
 
@@ -1088,6 +1224,94 @@ mod tests {
         }
         let both = check(&hyperframes, &["--props", "{}", "--timeout", "5"]).unwrap_err();
         assert!(both.contains("--props and --timeout"), "{both}");
+    }
+
+    #[test]
+    fn a_scale_is_above_zero_and_at_most_four_and_for_remotion_only() {
+        for scale in ["0", "-1", "4.5", "nan", "inf", "x"] {
+            let argv = ["strobe", "render", "p", "-o", "o.mp4", "--scale", scale];
+            assert!(Cli::try_parse_from(argv).is_err(), "--scale {scale}");
+        }
+        let remotion = project(
+            "remotion-scale",
+            Some(r#"{"dependencies":{"remotion":"4.0.0"}}"#),
+        );
+        let args = render_args(&remotion, &["--scale", "1.3333"]);
+        assert_eq!(args.scale, Some(1.3333));
+        assert!(args.check_framework_flags().is_ok());
+        let hyperframes = project("hyperframes-scale", None);
+        let message = render_args(&hyperframes, &["--scale", "2"])
+            .check_framework_flags()
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("--scale"), "{message}");
+    }
+
+    #[test]
+    fn encode_flags_map_to_settings_and_default_to_upstream() {
+        let remotion = project(
+            "remotion-encode",
+            Some(r#"{"dependencies":{"remotion":"4.0.0"}}"#),
+        );
+        assert_eq!(
+            render_args(&remotion, &[]).encode().unwrap(),
+            EncodeSettings::default()
+        );
+        let master = render_args(
+            &remotion,
+            &[
+                "--codec",
+                "hevc",
+                "--quality",
+                "19",
+                "--max-bitrate",
+                "80",
+                "--preset",
+                "p7",
+                "--tune",
+                "hq",
+                "--gop",
+                "60",
+                "--bframes",
+                "3",
+            ],
+        );
+        assert!(master.check_framework_flags().is_ok());
+        assert_eq!(
+            master.encode().unwrap(),
+            EncodeSettings {
+                constant_quality: Some(19),
+                max_bit_rate: Some(80_000_000),
+                preset: Some(7),
+                tune: Some(Tune::HighQuality),
+                gop: Some(60),
+                b_frames: Some(3),
+                ..Default::default()
+            }
+        );
+        let vbr = render_args(&remotion, &["--bitrate", "12.5", "--color", "bt709"]);
+        let settings = vbr.encode().unwrap();
+        assert_eq!(settings.bit_rate, Some(12_500_000));
+        assert_eq!(settings.colour, Some(ColourSpace::BT709));
+        let argv = ["strobe", "render", "p", "-o", "o.mp4", "--quality", "18"];
+        assert!(Cli::try_parse_from([&argv[..], &["--bitrate", "20"][..]].concat()).is_err());
+        assert!(render_args(&remotion, &["--10bit"]).encode().is_err());
+        let ten_bit = render_args(&remotion, &["--codec", "hevc", "--10bit"]).encode();
+        if cfg!(windows) {
+            let ten_bit = ten_bit.unwrap();
+            assert!(ten_bit.ten_bit);
+            assert_eq!(ten_bit.colour, Some(ColourSpace::BT709));
+            let kept = ["--codec", "hevc", "--10bit", "--color", "remotion"];
+            assert!(render_args(&remotion, &kept).encode().is_err());
+        } else {
+            assert!(ten_bit.is_err());
+        }
+        let hyperframes = project("hyperframes-encode", None);
+        let message = render_args(&hyperframes, &["--gop", "60", "--10bit"])
+            .check_framework_flags()
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("--gop and --10bit"), "{message}");
     }
 
     #[test]

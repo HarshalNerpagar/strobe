@@ -12,7 +12,9 @@ use image::{ExtendedColorType, ImageEncoder, RgbImage};
 use serde::{Deserialize, Serialize};
 use vrf::colour::Rect;
 
-use super::{Composition, Options, Page, RETRY_MARK, Ready, Renderer, Taken, Warmth};
+use super::{
+    Composition, Options, Page, RETRY_MARK, Ready, Renderer, Taken, Warmth, scaled_size,
+};
 use crate::Ui;
 use crate::adapters::since;
 use crate::driver::{Capture, Warm};
@@ -261,7 +263,9 @@ impl Renderer {
             Ready::Warm(view) => view,
             Ready::Open => loaded.page.open(ui, width, height)?.0,
             Ready::Unmounted(mut view) => {
-                Page::fit(&mut view, &composition)?;
+                let (_, _, factor) =
+                    scaled_size(composition.width, composition.height, job.options.scale)?;
+                Page::fit(&mut view, &composition, factor)?;
                 view
             }
         };
@@ -423,6 +427,7 @@ mod tests {
                 audio: false,
                 video: super::super::VideoDecoder::Native,
                 skip: true,
+                scale: 1.0,
             },
             frames: vec![1],
             output: PathBuf::from("o"),

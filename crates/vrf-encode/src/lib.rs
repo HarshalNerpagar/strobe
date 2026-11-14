@@ -158,6 +158,41 @@ impl ColourSpace {
     };
 }
 
+/// The encoder's speed and quality trade-off tuning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tune {
+    HighQuality,
+    LowLatency,
+    UltraLowLatency,
+}
+
+/// What a render asks of the encoder beyond the codec. Every field left at its default keeps the
+/// encoder's own choice for [`Quality`]: on NVENC preset P1, constant quality 17, no B-frames, a
+/// keyframe every 240 frames, 8-bit. NVENC applies every field; other encoders ignore the rate
+/// control fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EncodeSettings {
+    /// Constant quality, 1 (best) to 51.
+    pub constant_quality: Option<u8>,
+    /// Variable bitrate with this average, in bits per second.
+    pub bit_rate: Option<u32>,
+    /// The peak bitrate in bits per second: of the variable bitrate, or the ceiling of constant
+    /// quality.
+    pub max_bit_rate: Option<u32>,
+    /// NVENC preset, 1 (fastest) to 7 (best).
+    pub preset: Option<u8>,
+    pub tune: Option<Tune>,
+    /// Frames from one keyframe to the next.
+    pub gop: Option<u32>,
+    /// Consecutive B-frames.
+    pub b_frames: Option<u32>,
+    /// 10-bit from P010 input: HEVC Main10, or AV1 on NVENC.
+    pub ten_bit: bool,
+    /// The YCbCr matrix and range; the framework adapter's own choice if absent.
+    pub colour: Option<ColourSpace>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncoderConfig {
     pub codec: Codec,
@@ -169,6 +204,8 @@ pub struct EncoderConfig {
     /// 10-bit from P010 input: HEVC Main10, or AV1 on NVENC. Rejected for other codecs.
     pub ten_bit: bool,
     pub colour: ColourSpace,
+    /// Rate control and stream structure beyond `quality`.
+    pub settings: EncodeSettings,
 }
 
 impl EncoderConfig {
@@ -182,6 +219,7 @@ impl EncoderConfig {
             quality: Quality::default(),
             ten_bit: false,
             colour: ColourSpace::BT709,
+            settings: EncodeSettings::default(),
         }
     }
 }

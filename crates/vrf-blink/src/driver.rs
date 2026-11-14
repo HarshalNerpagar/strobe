@@ -12,7 +12,9 @@ use vrf::colour::Chroma;
 use vrf::mux::{Container, Muxer};
 use vrf::sched::{self, Consumer, Producer, Submission};
 use vrf::sink::Sink;
-use vrf_encode::{Codec, ColourSpace, Encoder, EncoderConfig, EncoderFrame, Rational};
+use vrf_encode::{
+    Codec, ColourSpace, EncodeSettings, Encoder, EncoderConfig, EncoderFrame, Rational,
+};
 
 #[cfg(target_os = "macos")]
 pub use crate::pipeline_mac::Warm;
@@ -22,6 +24,8 @@ use crate::pipeline_mac::{
 };
 #[cfg(windows)]
 pub use crate::pipeline_win::Warm;
+#[cfg(windows)]
+use crate::pipeline_win::video_memory;
 #[cfg(windows)]
 use crate::pipeline_win::{
     Converting, ConvertingSpec, Frame, Keep, POOL_MARGIN, Started, Submit, start, turbo_default,
@@ -36,6 +40,8 @@ const MIN_RUN: u64 = 80;
 const LEAD_IN_RUNS: u64 = 10;
 const MIN_RUN_LEAD_INS: u64 = 4;
 const TICKING_TIMEOUT: Duration = Duration::from_secs(30);
+const FULL_HD_FRAME_BYTES: u64 = 1920 * 1088 * 3 / 2;
+const VIDEO_MEMORY_SHARE: u64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -54,6 +60,9 @@ pub struct Config {
     /// An estimate of what each frame costs to render, used to claim the slowest fixed ranges
     /// first.
     pub costs: Option<Vec<f64>>,
+    /// Rate control, stream structure and bit depth for the encoder. Its colour is applied by
+    /// the adapter to `colour`.
+    pub encode: EncodeSettings,
 }
 
 impl Config {
@@ -72,13 +81,29 @@ impl Config {
             colour: ColourSpace::BT709,
             jpeg_capture: false,
             costs: None,
+            encode: EncodeSettings::default(),
         }
     }
 
     pub(crate) fn encoder_config(&self) -> EncoderConfig {
         let mut config = EncoderConfig::new(self.codec, self.width, self.height, self.frame_rate);
         config.colour = self.colour;
+        config.ten_bit = self.encode.ten_bit;
+        if let Some(gop) = self.encode.gop {
+            config.keyframe_interval = gop;
+        }
+        config.settings = self.encode;
         config
+    }
+
+    /// The bytes of one NV12 or P010 frame.
+    pub(crate) fn frame_bytes(&self) -> u64 {
+        let bytes = u64::from(self.width) * u64::from(self.height) * 3 / 2;
+        if self.encode.ten_bit {
+            bytes * 2
+        } else {
+            bytes
+        }
     }
 
     pub(crate) fn chroma(&self) -> Chroma {
@@ -453,10 +478,32 @@ fn physical_memory() -> Option<u64> {
     None
 }
 
-/// Frame buffers the memory budget holds beyond the pool's margin.
+#[cfg(not(windows))]
+fn video_memory() -> Option<u64> {
+    None
+}
+
+/// Frame buffers the pool budget holds beyond the pool's margin.
 fn allowed(frame_bytes: u64) -> usize {
-    let buffers = (memory_budget() / frame_bytes) as usize;
+    let buffers = (pool_budget(frame_bytes, video_memory()) / frame_bytes) as usize;
     buffers.saturating_sub(POOL_MARGIN).max(WINDOW)
+}
+
+/// The memory budget, and for frames larger than 1080p at most a quarter of the encoder GPU's
+/// dedicated memory, where the encoder's input pool lives beside the views' larger surfaces.
+/// `VRF_MAX_POOL_MB` overrides both.
+fn pool_budget(frame_bytes: u64, video_memory: Option<u64>) -> u64 {
+    if let Some(megabytes) = std::env::var("VRF_MAX_POOL_MB")
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+    {
+        return megabytes << 20;
+    }
+    let budget = memory_budget();
+    match video_memory {
+        Some(bytes) if frame_bytes > FULL_HD_FRAME_BYTES => budget.min(bytes / VIDEO_MEMORY_SHARE),
+        _ => budget,
+    }
 }
 
 /// An eighth of the machine's memory for frames waiting on the encoder, between 1.5 and 3 GB.
@@ -1020,7 +1067,7 @@ pub fn render_runs<T: Send>(
     let started = Instant::now();
     let opening = Limit::new(OPENING);
     let open = || opening.run(&open);
-    let frame_bytes = u64::from(config.width) * u64::from(config.height) * 3 / 2;
+    let frame_bytes = config.frame_bytes();
     let plan = plan.fit(frame_bytes).sized(config.frames);
     let mut config = config.clone();
     let moved = plan.moved(config.costs.as_deref(), frame_bytes);
@@ -1315,6 +1362,16 @@ mod tests {
         assert!(fitted.views >= 1 && fitted.views < 8);
         let ahead = (fitted.views as u64 - 1) * fitted.run + fitted.views as u64;
         assert!(ahead * frame_bytes <= memory_budget());
+    }
+
+    #[test]
+    fn video_memory_caps_the_pool_only_above_1080p() {
+        let video_memory = Some(8u64 << 30);
+        let full_hd = 1920 * 1080 * 3 / 2;
+        let uhd = 3840 * 2160 * 3 / 2;
+        assert_eq!(pool_budget(full_hd, video_memory), memory_budget());
+        assert_eq!(pool_budget(uhd, None), memory_budget());
+        assert_eq!(pool_budget(uhd, video_memory), memory_budget().min(2 << 30));
     }
 
     #[test]

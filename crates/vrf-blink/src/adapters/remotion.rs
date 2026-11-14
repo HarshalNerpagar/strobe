@@ -16,7 +16,7 @@ use ring::digest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use vrf::audio::{RemotionAsset, remotion_clips};
-use vrf_encode::{Codec, ColourSpace, Matrix, Range, Rational};
+use vrf_encode::{Codec, ColourSpace, EncodeSettings, Matrix, Range, Rational};
 
 use super::hyperframes;
 use super::{
@@ -99,6 +99,35 @@ pub struct Options {
     pub audio: bool,
     pub video: VideoDecoder,
     pub skip: bool,
+    /// Device pixels per CSS pixel, as Remotion's `scale`: the composition is laid out at its own
+    /// size and the output is this many times larger, each side rounded to even.
+    #[serde(default = "unscaled")]
+    pub scale: f64,
+}
+
+fn unscaled() -> f64 {
+    1.0
+}
+
+/// The output size of a `width` x `height` composition at `scale`, each side rounded to even, and
+/// the device scale factor that rasterises it at exactly that size. Fails if no one factor gives
+/// both sides.
+pub fn scaled_size(width: u32, height: u32, scale: f64) -> Result<(u32, u32, f32)> {
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "scale {scale} is not a positive number"
+    );
+    if scale == 1.0 {
+        return Ok((width, height, 1.0));
+    }
+    let even = |side: u32| ((f64::from(side) * scale / 2.0).round() as u32).max(1) * 2;
+    let (scaled_width, scaled_height) = (even(width), even(height));
+    let factor = scaled_width as f32 / width as f32;
+    ensure!(
+        height as f32 * factor == scaled_height as f32,
+        "scale {scale} turns {width}x{height} into {scaled_width}x{scaled_height}, which no single device scale factor gives"
+    );
+    Ok((scaled_width, scaled_height, factor))
 }
 
 /// One render: what to render, which frames of it, the codec, and where the file goes.
@@ -109,6 +138,10 @@ pub struct RenderJob {
     pub frames: Option<RangeInclusive<u64>>,
     pub codec: Codec,
     pub output: PathBuf,
+    /// Rate control, stream structure, bit depth and colour. Left at default, the encoder keeps
+    /// its own choices and H.264 and HEVC carry Remotion's BT.601 full range.
+    #[serde(default)]
+    pub encode: EncodeSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -189,6 +222,11 @@ pub struct Report {
     pub skipped: u64,
     pub capture_retries: u64,
     pub seek_retries: u64,
+    /// The size of the video, the composition's own times the scale.
+    #[serde(default)]
+    pub output_width: u32,
+    #[serde(default)]
+    pub output_height: u32,
     #[serde(skip)]
     pub assets: Vec<FrameAssets>,
 }
@@ -640,6 +678,7 @@ pub struct Page {
     track: bool,
     composition: String,
     native: Option<Native>,
+    scale: f64,
 }
 
 impl Page {
@@ -660,6 +699,7 @@ impl Page {
             track: options.skip,
             composition: serde_json::to_string(&options.composition)?,
             native: None,
+            scale: options.scale,
         })
     }
 
@@ -688,14 +728,16 @@ impl Page {
     }
 
     /// Opens a view of `width` x `height` with the adapter and the virtual clock injected, and
-    /// initialises the composition in it.
+    /// initialises the composition in it. The view rasterises at the page's scale.
     pub fn open(&self, ui: &Ui, width: i32, height: i32) -> Result<(View, Composition)> {
-        let mut view = View::open_project(
+        let (_, _, factor) = scaled_size(width as u32, height as u32, self.scale)?;
+        let mut view = View::open_project_scaled(
             ui,
             &self.project,
             "index.html",
             width,
             height,
+            factor,
             Some(&self.script()),
         )?;
         self.link(&mut view);
@@ -723,12 +765,13 @@ impl Page {
     /// Opens a view at a guessed size and resolves the composition in it without mounting it, so
     /// the size is known before the page draws anything. [`Page::fit`] finishes the job.
     fn open_unmounted(&self, ui: &Ui) -> Result<(View, Composition)> {
-        let mut view = View::launch_project(
+        let mut view = View::launch_project_scaled(
             ui,
             &self.project,
             "index.html",
             FIRST_VIEW_SIZE.0,
             FIRST_VIEW_SIZE.1,
+            self.scale as f32,
             Some(&self.script()),
         )?;
         self.link(&mut view);
@@ -741,11 +784,13 @@ impl Page {
         Ok((view, serde_json::from_value(meta)?))
     }
 
-    /// Resizes a view from [`Page::open_unmounted`] to the composition's size before anything
-    /// has painted, settles begin frames at that size and mounts the composition.
-    fn fit(view: &mut View, composition: &Composition) -> Result<()> {
-        if (composition.width as i32, composition.height as i32) != FIRST_VIEW_SIZE {
-            view.resize(composition.width as i32, composition.height as i32);
+    /// Resizes a view from [`Page::open_unmounted`] to the composition's size at `factor` device
+    /// pixels per CSS pixel before anything has painted, settles begin frames at that size and
+    /// mounts the composition.
+    fn fit(view: &mut View, composition: &Composition, factor: f32) -> Result<()> {
+        let size = (composition.width as i32, composition.height as i32);
+        if size != FIRST_VIEW_SIZE || view.scale() != factor {
+            view.resize_scaled(size.0, size.1, factor);
         }
         view.settle()?;
         view.evaluate("__vrf.rm.mount()")
@@ -845,6 +890,7 @@ struct Key {
     mode: Mode,
     video: VideoDecoder,
     skip: bool,
+    scale: f64,
 }
 
 struct Loaded {
@@ -1027,6 +1073,7 @@ impl Renderer {
             mode: options.mode,
             video: options.video,
             skip: options.skip,
+            scale: options.scale,
         };
         let step = Instant::now();
         let (kept, props_swapped) = match self.loaded.iter().position(|loaded| loaded.key == key) {
@@ -1133,7 +1180,9 @@ impl Renderer {
             }
             None => {
                 let (mut view, composition) = loaded.page.open_unmounted(ui)?;
-                Page::fit(&mut view, &composition)?;
+                let (_, _, factor) =
+                    scaled_size(composition.width, composition.height, options.scale)?;
+                Page::fit(&mut view, &composition, factor)?;
                 loaded.composition = Some(composition);
                 loaded.spare = Some(view);
                 composition
@@ -1231,6 +1280,7 @@ impl Renderer {
             frames,
             codec,
             output: out,
+            encode,
         } = job;
         let (codec, out) = (*codec, out.as_path());
         let started = Instant::now();
@@ -1257,11 +1307,11 @@ impl Renderer {
         };
         loaded.composition = Some(composition);
         let view_warm = matches!(ready, Ready::Warm(_));
+        let (output_width, output_height, factor) =
+            scaled_size(composition.width, composition.height, options.scale)?;
         ensure!(
-            composition.width % 2 == 0 && composition.height % 2 == 0,
-            "{}x{} has an odd side; padding to even is not implemented",
-            composition.width,
-            composition.height
+            output_width % 2 == 0 && output_height % 2 == 0,
+            "{output_width}x{output_height} has an odd side; padding to even is not implemented"
         );
         let range = frames
             .clone()
@@ -1282,14 +1332,15 @@ impl Renderer {
             None => self.warm.as_mut().context("the GPU state is missing")?,
         };
         let mut config = Config::new(
-            composition.width,
-            composition.height,
+            output_width,
+            output_height,
             composition.frame_rate()?,
             codec,
             count,
         );
         config.skip = options.skip.then(Skip::tracked);
-        config.colour = colour(codec);
+        config.colour = encode.colour.unwrap_or(colour(codec));
+        config.encode = *encode;
         let (width, height) = (composition.width as i32, composition.height as i32);
         let page = &loaded.page;
         let live = options.audio.then(|| {
@@ -1311,7 +1362,7 @@ impl Renderer {
                 Ready::Warm(view) => Ok(view),
                 Ready::Open => page.open(ui, width, height).map(|(view, _)| view),
                 Ready::Unmounted(mut view) => {
-                    Page::fit(&mut view, &composition)?;
+                    Page::fit(&mut view, &composition, factor)?;
                     Ok(view)
                 }
             })));
@@ -1440,6 +1491,8 @@ impl Renderer {
             skipped: stats.skipped,
             capture_retries: stats.retries,
             seek_retries: seek_retries.into_inner(),
+            output_width,
+            output_height,
             assets: collected,
         })
     }
@@ -1626,6 +1679,22 @@ mod tests {
             format!("{error:#}").contains("printed nothing"),
             "{error:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_scale_rounds_each_side_to_even_at_one_device_scale_factor() -> Result<()> {
+        assert_eq!(scaled_size(1920, 1080, 1.0)?, (1920, 1080, 1.0));
+        assert_eq!(scaled_size(1921, 1080, 1.0)?, (1921, 1080, 1.0));
+        assert_eq!(scaled_size(1920, 1080, 2.0)?, (3840, 2160, 2.0));
+        let (width, height, factor) = scaled_size(1920, 1080, 1.3333)?;
+        assert_eq!((width, height), (2560, 1440));
+        assert_eq!(1920.0 * factor, 2560.0);
+        assert_eq!(1080.0 * factor, 1440.0);
+        assert_eq!(scaled_size(1080, 1920, 4.0 / 3.0)?.0, 1440);
+        assert!(scaled_size(1920, 1080, 0.0).is_err());
+        assert!(scaled_size(1920, 1080, f64::NAN).is_err());
+        assert!(scaled_size(1000, 2, 1.5).is_err());
         Ok(())
     }
 

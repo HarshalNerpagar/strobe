@@ -52,6 +52,7 @@ pub fn options(project: &Path, composition: &str) -> Options {
         audio: true,
         video: VideoDecoder::Native,
         skip: false,
+        scale: 1.0,
     }
 }
 
@@ -67,6 +68,7 @@ pub fn render(
         frames,
         codec,
         output: out.to_owned(),
+        encode: Default::default(),
     };
     Renderer::new(1).render(ui, &job, SystemTime::now(), &mut |_, _| Ok(()))
 }

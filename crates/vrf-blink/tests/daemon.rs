@@ -35,6 +35,7 @@ fn start(ui: &Ui, tag: &str, idle: Duration) -> Result<Daemon> {
         idle,
         cpu_raster: true,
         projects: 2,
+        hot_props: false,
     };
     let ui = ui.clone();
     let thread = thread::spawn(move || daemon::serve(&ui, &config));
@@ -74,9 +75,7 @@ impl Daemon {
         match self.call(Job::Render(job), true, None, &AtomicBool::new(false))? {
             Reply::Rendered(report, _) => Ok(*report),
             Reply::Refused(reason) => bail!("refused: {reason}"),
-            Reply::Pong | Reply::Gone | Reply::RenderedHyperframes(_) => {
-                bail!("no render came back")
-            }
+            _ => bail!("no render came back"),
         }
     }
 
@@ -101,6 +100,7 @@ fn job(project: &Path, composition: &str, frames: Option<(u64, u64)>, out: &Path
         frames: frames.map(|(first, last)| first..=last),
         codec: Codec::H264,
         output: out.to_owned(),
+        encode: Default::default(),
     }
 }
 

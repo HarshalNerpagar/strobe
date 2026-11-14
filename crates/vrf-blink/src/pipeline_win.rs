@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -19,6 +19,13 @@ use crate::driver::{Config, submit_loop};
 use crate::win;
 
 pub const POOL_MARGIN: usize = 32;
+
+static VIDEO_MEMORY: OnceLock<Option<u64>> = OnceLock::new();
+
+/// The dedicated memory of the GPU the encoder runs on, once a [`Warm`] has opened it.
+pub fn video_memory() -> Option<u64> {
+    VIDEO_MEMORY.get().copied().flatten()
+}
 
 fn chunk_frames(width: u32, height: u32) -> u64 {
     if u64::from(width) * u64::from(height) > 1920 * 1088 {
@@ -41,6 +48,7 @@ pub fn turbo_default(_: Codec) -> bool {
 pub struct Warm {
     gpu: Gpu,
     converter: Arc<Converter>,
+    ten_bit: Option<Arc<Converter>>,
 }
 
 unsafe impl Send for Warm {}
@@ -51,11 +59,23 @@ impl Warm {
             Some(luid) => Gpu::with_luid(luid)?,
             None => Gpu::new()?,
         };
+        let _ = VIDEO_MEMORY.set(gpu.video_memory());
         let converter = Converter::new(&gpu, Format::Nv12);
         Ok(Warm {
             gpu,
             converter: Arc::new(converter),
+            ten_bit: None,
         })
+    }
+
+    fn converter(&mut self, ten_bit: bool) -> Arc<Converter> {
+        if !ten_bit {
+            return self.converter.clone();
+        }
+        let gpu = &self.gpu;
+        self.ten_bit
+            .get_or_insert_with(|| Arc::new(Converter::new(gpu, Format::P010)))
+            .clone()
     }
 
     pub fn prepare(&mut self, _width: u32, _height: u32, _colour: ColourSpace) -> Result<()> {
@@ -88,7 +108,8 @@ pub fn start(
     sink: Sink,
 ) -> Result<Started> {
     let encoder_config = config.encoder_config();
-    let options = Options::from(encoder_config.quality);
+    let options = Options::for_config(&encoder_config)?;
+    let converter = warm.converter(encoder_config.ten_bit);
     let device = warm.gpu.d3d12_device()?;
     let pool_size = config.window + POOL_MARGIN;
     let frame_rate = config.frame_rate;
@@ -98,7 +119,7 @@ pub fn start(
             NvencSessions::new(&device, encoder_config, options, config.sessions, pool_size)?;
         let converting = Converting::new(
             warm.gpu.clone(),
-            warm.converter.clone(),
+            converter,
             encoder.pools(),
             chunk,
             config.chroma(),
@@ -109,7 +130,7 @@ pub fn start(
         match NvencEncoder::with_pool_size(&device, encoder_config.clone(), options, pool_size) {
             Ok(encoder) => {
                 let pool = encoder.pool().clone();
-                single(warm, config, encoder, pool, consumer, sink)?
+                single(warm, converter, config, encoder, pool, consumer, sink)?
             }
             Err(nvenc) if encoder_config.codec == Codec::H264 => {
                 let encoder = D3d12H264Encoder::new(&device, &encoder_config, pool_size)
@@ -117,7 +138,7 @@ pub fn start(
                         format!("NVENC cannot open ({nvenc:#}) and neither can D3D12 Video Encode")
                     })?;
                 let pool = encoder.pool().clone();
-                single(warm, config, encoder, pool, consumer, sink)?
+                single(warm, converter, config, encoder, pool, consumer, sink)?
             }
             Err(nvenc) => {
                 return Err(nvenc.context(
@@ -135,6 +156,7 @@ pub fn start(
 
 fn single<E: Encoder + Send + 'static>(
     warm: &Warm,
+    converter: Arc<Converter>,
     config: &Config,
     encoder: E,
     pool: InputPool,
@@ -143,7 +165,7 @@ fn single<E: Encoder + Send + 'static>(
 ) -> Result<(Converting, Submit)> {
     let converting = Converting::new(
         warm.gpu.clone(),
-        warm.converter.clone(),
+        converter,
         vec![pool],
         chunk_frames(config.width, config.height),
         config.chroma(),
