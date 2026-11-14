@@ -920,6 +920,9 @@ pub struct LoadedProject {
     /// A short hash of the props text, to tell which props a warm page holds.
     pub props: String,
     pub size: Option<Composition>,
+    /// Device pixels per CSS pixel the page rasterises at.
+    #[serde(default = "unscaled")]
+    pub scale: f64,
     pub spare_view: bool,
 }
 
@@ -963,6 +966,7 @@ impl Loaded {
             composition: self.key.composition.clone(),
             props: short_hex(context),
             size: self.composition,
+            scale: self.key.scale,
             spare_view: self.spare.is_some(),
         }
     }

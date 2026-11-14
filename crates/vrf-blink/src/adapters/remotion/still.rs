@@ -12,9 +12,7 @@ use image::{ExtendedColorType, ImageEncoder, RgbImage};
 use serde::{Deserialize, Serialize};
 use vrf::colour::Rect;
 
-use super::{
-    Composition, Options, Page, RETRY_MARK, Ready, Renderer, Taken, Warmth, scaled_size,
-};
+use super::{Composition, Options, Page, RETRY_MARK, Ready, Renderer, Taken, Warmth, scaled_size};
 use crate::Ui;
 use crate::adapters::since;
 use crate::driver::{Capture, Warm};
@@ -43,7 +41,8 @@ pub struct StillJob {
     /// JPEG quality, 1 to 100, for a JPEG beside or instead of the PNG.
     #[serde(default)]
     pub jpeg: Option<u8>,
-    /// A factor the images are resized by after the capture, at most 1.
+    /// A factor the images are resized by after the capture, at most 1. `options.scale` renders
+    /// them larger.
     #[serde(default = "one")]
     pub scale: f64,
 }
@@ -206,7 +205,7 @@ fn check(job: &StillJob) -> Result<()> {
     );
     ensure!(
         job.scale > 0.0 && job.scale <= 1.0,
-        "a still is scaled by more than 0 and at most 1 (rendering above the composition size is not implemented)"
+        "a still is resized by more than 0 and at most 1; options.scale renders it larger"
     );
     Ok(())
 }

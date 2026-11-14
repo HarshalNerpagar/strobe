@@ -244,8 +244,10 @@ struct StillArgs {
     /// Write no PNG, only the JPEG.
     #[arg(long, requires = "jpeg")]
     no_png: bool,
-    /// Resize the images by this factor, at most 1, after the capture.
-    #[arg(long, default_value_t = 1.0)]
+    /// The images are this many times the composition's size, at most 4. Above 1 the page
+    /// rasterises at that device scale, as `strobe render --scale` does; at most 1 the capture
+    /// is resized.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
     scale: f64,
     /// Capture in this process even if a daemon is running.
     #[arg(long)]
@@ -265,6 +267,10 @@ struct WarmArgs {
     /// For a daemon this command starts: see `strobe daemon --hot-props`.
     #[arg(long)]
     hot_props: bool,
+    /// The device scale of the page, as for `strobe render --scale`, so a render or still at
+    /// that scale starts warm. 1 if absent.
+    #[arg(long, value_parser = parse_scale)]
+    scale: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -912,13 +918,20 @@ fn print_json(value: &Value) {
 }
 
 fn still_job(args: &StillArgs) -> Result<StillJob> {
+    let (device, resize) = if args.scale > 1.0 {
+        (args.scale, 1.0)
+    } else {
+        (1.0, args.scale)
+    };
+    let mut options = args.page.options()?;
+    options.scale = device;
     Ok(StillJob {
-        options: args.page.options()?,
+        options,
         frames: args.frames.0.clone(),
         output: std::path::absolute(&args.output)?,
         png: !args.no_png,
         jpeg: args.jpeg,
-        scale: args.scale,
+        scale: resize,
     })
 }
 
@@ -1015,7 +1028,8 @@ fn run_still(args: StillArgs, cpu_raster: bool, command_start: SystemTime) -> Re
 const DAEMON_START: Duration = Duration::from_secs(120);
 
 fn run_warm(args: WarmArgs, cpu_raster: bool, command_start: SystemTime) -> Result<()> {
-    let options = args.page.options()?;
+    let mut options = args.page.options()?;
+    options.scale = args.scale.unwrap_or(1.0);
     let socket = daemon::socket_path();
     let mut started = false;
     let stream = match daemon::connect(&socket) {
@@ -1403,6 +1417,15 @@ mod tests {
             still.page.options().unwrap(),
             options(render.work(Plan::single()).unwrap())
         );
+        let job = |scale: &str| {
+            still_job(&still_args(&remotion, &["--frames", "1", "--scale", scale]).unwrap())
+                .unwrap()
+        };
+        let larger = job("2");
+        assert_eq!((larger.options.scale, larger.scale), (2.0, 1.0));
+        let smaller = job("0.5");
+        assert_eq!((smaller.options.scale, smaller.scale), (1.0, 0.5));
+        assert!(still_args(&remotion, &["--frames", "1", "--scale", "5"]).is_err());
         assert!(still_args(&remotion, &["--frames", "1", "--no-png"]).is_err());
         assert!(still_args(&remotion, &["--frames", "1", "--jpeg", "0"]).is_err());
         assert!(still_args(&remotion, &[]).is_err());
