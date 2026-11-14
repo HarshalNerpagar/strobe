@@ -101,6 +101,7 @@ fn job(project: &Path, composition: &str, frames: Option<(u64, u64)>, out: &Path
         frames: frames.map(|(first, last)| first..=last),
         codec: Codec::H264,
         output: out.to_owned(),
+        encode: Default::default(),
     }
 }
 

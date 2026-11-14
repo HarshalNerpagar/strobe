@@ -12,7 +12,9 @@ use vrf::colour::Chroma;
 use vrf::mux::{Container, Muxer};
 use vrf::sched::{self, Consumer, Producer, Submission};
 use vrf::sink::Sink;
-use vrf_encode::{Codec, ColourSpace, Encoder, EncoderConfig, EncoderFrame, Rational};
+use vrf_encode::{
+    Codec, ColourSpace, EncodeSettings, Encoder, EncoderConfig, EncoderFrame, Rational,
+};
 
 #[cfg(target_os = "macos")]
 pub use crate::pipeline_mac::Warm;
@@ -58,6 +60,9 @@ pub struct Config {
     /// An estimate of what each frame costs to render, used to claim the slowest fixed ranges
     /// first.
     pub costs: Option<Vec<f64>>,
+    /// Rate control, stream structure and bit depth for the encoder. Its colour is applied by
+    /// the adapter to `colour`.
+    pub encode: EncodeSettings,
 }
 
 impl Config {
@@ -76,13 +81,29 @@ impl Config {
             colour: ColourSpace::BT709,
             jpeg_capture: false,
             costs: None,
+            encode: EncodeSettings::default(),
         }
     }
 
     pub(crate) fn encoder_config(&self) -> EncoderConfig {
         let mut config = EncoderConfig::new(self.codec, self.width, self.height, self.frame_rate);
         config.colour = self.colour;
+        config.ten_bit = self.encode.ten_bit;
+        if let Some(gop) = self.encode.gop {
+            config.keyframe_interval = gop;
+        }
+        config.settings = self.encode;
         config
+    }
+
+    /// The bytes of one NV12 or P010 frame.
+    pub(crate) fn frame_bytes(&self) -> u64 {
+        let bytes = u64::from(self.width) * u64::from(self.height) * 3 / 2;
+        if self.encode.ten_bit {
+            bytes * 2
+        } else {
+            bytes
+        }
     }
 
     pub(crate) fn chroma(&self) -> Chroma {
@@ -1046,7 +1067,7 @@ pub fn render_runs<T: Send>(
     let started = Instant::now();
     let opening = Limit::new(OPENING);
     let open = || opening.run(&open);
-    let frame_bytes = u64::from(config.width) * u64::from(config.height) * 3 / 2;
+    let frame_bytes = config.frame_bytes();
     let plan = plan.fit(frame_bytes).sized(config.frames);
     let mut config = config.clone();
     let moved = plan.moved(config.costs.as_deref(), frame_bytes);

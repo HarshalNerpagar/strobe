@@ -16,7 +16,7 @@ use ring::digest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use vrf::audio::{RemotionAsset, remotion_clips};
-use vrf_encode::{Codec, ColourSpace, Matrix, Range, Rational};
+use vrf_encode::{Codec, ColourSpace, EncodeSettings, Matrix, Range, Rational};
 
 use super::hyperframes;
 use super::{
@@ -123,6 +123,10 @@ pub struct RenderJob {
     pub frames: Option<RangeInclusive<u64>>,
     pub codec: Codec,
     pub output: PathBuf,
+    /// Rate control, stream structure, bit depth and colour. Left at default, the encoder keeps
+    /// its own choices and H.264 and HEVC carry Remotion's BT.601 full range.
+    #[serde(default)]
+    pub encode: EncodeSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -813,6 +817,7 @@ impl Renderer {
             frames,
             codec,
             output: out,
+            encode,
         } = job;
         let (codec, out) = (*codec, out.as_path());
         let started = Instant::now();
@@ -909,7 +914,8 @@ impl Renderer {
             count,
         );
         config.skip = options.skip.then(Skip::tracked);
-        config.colour = colour(codec);
+        config.colour = encode.colour.unwrap_or(colour(codec));
+        config.encode = *encode;
         let (width, height) = (composition.width as i32, composition.height as i32);
         let page = &loaded.page;
         let live = options.audio.then(|| {

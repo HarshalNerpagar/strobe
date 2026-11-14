@@ -489,7 +489,10 @@ fn session(
         preset,
         tuning,
         rate_control: match tuning {
-            Tuning::HighQuality => RateControl::Vbr(20_000_000),
+            Tuning::HighQuality => RateControl::Vbr {
+                average: 20_000_000,
+                peak: 20_000_000,
+            },
             _ => RateControl::Cbr(20_000_000),
         },
         b_frames: 0,

@@ -20,7 +20,7 @@ use windows::core::Interface;
 use crate::bitstream;
 use crate::{
     Codec, ColourSpace, Encoder, EncoderConfig, EncoderFrame, Matrix, Packet, Quality, Range,
-    Rational, StreamInfo,
+    Rational, StreamInfo, Tune,
 };
 
 mod api;
@@ -52,6 +52,20 @@ pub enum Preset {
 }
 
 impl Preset {
+    /// P1 to P7 by number.
+    pub fn number(number: u8) -> Result<Preset> {
+        Ok(match number {
+            1 => Preset::P1,
+            2 => Preset::P2,
+            3 => Preset::P3,
+            4 => Preset::P4,
+            5 => Preset::P5,
+            6 => Preset::P6,
+            7 => Preset::P7,
+            other => bail!("NVENC has presets P1 to P7, not P{other}"),
+        })
+    }
+
     fn guid(self) -> nv::GUID {
         match self {
             Preset::P1 => guid::NV_ENC_PRESET_P1_GUID,
@@ -72,6 +86,16 @@ pub enum Tuning {
     UltraLowLatency,
 }
 
+impl From<Tune> for Tuning {
+    fn from(tune: Tune) -> Tuning {
+        match tune {
+            Tune::HighQuality => Tuning::HighQuality,
+            Tune::LowLatency => Tuning::LowLatency,
+            Tune::UltraLowLatency => Tuning::UltraLowLatency,
+        }
+    }
+}
+
 impl Tuning {
     fn info(self) -> nv::NV_ENC_TUNING_INFO {
         match self {
@@ -86,10 +110,13 @@ impl Tuning {
 pub enum RateControl {
     /// Constant bitrate in bits per second.
     Cbr(u32),
-    /// Variable bitrate with this average and maximum, in bits per second.
-    Vbr(u32),
+    /// Variable bitrate with this average and peak, in bits per second.
+    Vbr { average: u32, peak: u32 },
     /// Variable bitrate at a constant quality level, 1 (best) to 51.
     ConstantQuality(u8),
+    /// Constant quality held under this peak in bits per second, instead of the codec's own
+    /// ceiling.
+    CappedQuality { level: u8, peak: u32 },
 }
 
 /// How the NVENC session is set up, beyond what [`EncoderConfig`] says.
@@ -120,6 +147,59 @@ impl From<Quality> for Options {
             rate_control: RateControl::ConstantQuality(level),
             b_frames: 0,
         }
+    }
+}
+
+impl Options {
+    /// The options of `config.quality`, with what `config.settings` overrides.
+    pub fn for_config(config: &EncoderConfig) -> Result<Options> {
+        let settings = &config.settings;
+        let mut options = Options::from(config.quality);
+        if let Some(preset) = settings.preset {
+            options.preset = Preset::number(preset)?;
+        }
+        if let Some(tune) = settings.tune {
+            options.tuning = tune.into();
+        }
+        if let Some(b_frames) = settings.b_frames {
+            options.b_frames = b_frames;
+        }
+        let level = match options.rate_control {
+            RateControl::ConstantQuality(level) => level,
+            _ => unreachable!("every quality is constant quality"),
+        };
+        options.rate_control = match (
+            settings.constant_quality,
+            settings.bit_rate,
+            settings.max_bit_rate,
+        ) {
+            (Some(_), Some(_), _) => {
+                bail!("constant quality and an average bitrate exclude each other")
+            }
+            (None, Some(average), peak) => {
+                let peak = peak.unwrap_or(average.saturating_mul(2));
+                ensure!(
+                    peak >= average,
+                    "the peak bitrate {peak} is below the average {average}"
+                );
+                RateControl::Vbr { average, peak }
+            }
+            (quality, None, Some(peak)) => RateControl::CappedQuality {
+                level: quality.unwrap_or(level),
+                peak,
+            },
+            (Some(level), None, None) => RateControl::ConstantQuality(level),
+            (None, None, None) => options.rate_control,
+        };
+        if let RateControl::ConstantQuality(level) | RateControl::CappedQuality { level, .. } =
+            options.rate_control
+        {
+            ensure!(
+                (1..=51).contains(&level),
+                "constant quality {level} is not 1 to 51"
+            );
+        }
+        Ok(options)
     }
 }
 
@@ -251,15 +331,21 @@ fn configure(
             rc.averageBitRate = bits;
             rc.maxBitRate = bits;
         }
-        RateControl::Vbr(bits) => {
+        RateControl::Vbr { average, peak } => {
             rc.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
-            rc.averageBitRate = bits;
-            rc.maxBitRate = bits;
+            rc.averageBitRate = average;
+            rc.maxBitRate = peak;
         }
         RateControl::ConstantQuality(level) => {
             rc.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
             rc.averageBitRate = 0;
             rc.maxBitRate = constant_quality_ceiling(config.codec);
+            rc.targetQuality = level;
+        }
+        RateControl::CappedQuality { level, peak } => {
+            rc.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
+            rc.averageBitRate = 0;
+            rc.maxBitRate = peak;
             rc.targetQuality = level;
         }
     }
@@ -921,5 +1007,87 @@ impl Drop for NvencEncoder {
         }
         self.pool.unregister(&self.shared.session);
         self.shared.unregister();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EncodeSettings;
+
+    fn options(settings: EncodeSettings) -> Result<Options> {
+        let mut config = EncoderConfig::new(Codec::Hevc, 1920, 1080, Rational::new(30, 1));
+        config.settings = settings;
+        Options::for_config(&config)
+    }
+
+    #[test]
+    fn default_settings_keep_the_options_of_the_quality() -> Result<()> {
+        assert_eq!(
+            options(EncodeSettings::default())?,
+            Options::from(Quality::Balanced)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn settings_override_preset_tuning_b_frames_and_rate() -> Result<()> {
+        let master = options(EncodeSettings {
+            constant_quality: Some(19),
+            preset: Some(7),
+            tune: Some(Tune::HighQuality),
+            b_frames: Some(3),
+            ..Default::default()
+        })?;
+        assert_eq!(master.preset, Preset::P7);
+        assert_eq!(master.tuning, Tuning::HighQuality);
+        assert_eq!(master.b_frames, 3);
+        assert_eq!(master.rate_control, RateControl::ConstantQuality(19));
+        let vbr = options(EncodeSettings {
+            bit_rate: Some(40_000_000),
+            ..Default::default()
+        })?;
+        assert_eq!(
+            vbr.rate_control,
+            RateControl::Vbr {
+                average: 40_000_000,
+                peak: 80_000_000
+            }
+        );
+        let capped = options(EncodeSettings {
+            max_bit_rate: Some(60_000_000),
+            ..Default::default()
+        })?;
+        assert_eq!(
+            capped.rate_control,
+            RateControl::CappedQuality {
+                level: 17,
+                peak: 60_000_000
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn contradictory_or_out_of_range_settings_are_refused() {
+        let refused = |settings| options(settings).is_err();
+        assert!(refused(EncodeSettings {
+            constant_quality: Some(18),
+            bit_rate: Some(1),
+            ..Default::default()
+        }));
+        assert!(refused(EncodeSettings {
+            bit_rate: Some(40),
+            max_bit_rate: Some(20),
+            ..Default::default()
+        }));
+        assert!(refused(EncodeSettings {
+            preset: Some(8),
+            ..Default::default()
+        }));
+        assert!(refused(EncodeSettings {
+            constant_quality: Some(0),
+            ..Default::default()
+        }));
     }
 }
