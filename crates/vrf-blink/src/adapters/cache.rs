@@ -170,11 +170,12 @@ pub(crate) fn link_dir(target: &Path, link: &Path) -> io::Result<()> {
 /// for the life of the process.
 pub(crate) fn links_work(root: &Path) -> bool {
     static KNOWN: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
-    if let Some((_, works)) = KNOWN.lock().unwrap().iter().find(|(dir, _)| dir == root) {
+    let mut known = KNOWN.lock().unwrap();
+    if let Some((_, works)) = known.iter().find(|(dir, _)| dir == root) {
         return *works;
     }
     let works = probe(root).is_ok();
-    KNOWN.lock().unwrap().push((root.to_owned(), works));
+    known.push((root.to_owned(), works));
     works
 }
 
@@ -338,6 +339,27 @@ mod tests {
         let scratch = Scratch::new("probe");
         assert!(links_work(&scratch.0));
         assert_eq!(fs::read_dir(&scratch.0)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_that_ask_about_one_root_at_once_all_hear_that_links_work() -> io::Result<()> {
+        let scratch = Scratch::new("race");
+        let root = scratch.0.join("cache");
+        let start = std::sync::Barrier::new(8);
+        let answers: Vec<bool> = std::thread::scope(|scope| {
+            let asks: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        links_work(&root)
+                    })
+                })
+                .collect();
+            asks.into_iter().map(|ask| ask.join().unwrap()).collect()
+        });
+        assert_eq!(answers, vec![true; 8]);
+        assert_eq!(fs::read_dir(&root)?.count(), 0);
         Ok(())
     }
 

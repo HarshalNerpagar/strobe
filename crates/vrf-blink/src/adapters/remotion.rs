@@ -371,6 +371,10 @@ struct Located {
 }
 
 fn locate(project: &Path, entry: Option<&Path>) -> Result<Located> {
+    locate_in(&cache_dir().join("remotion"), hash_all(), project, entry)
+}
+
+fn locate_in(root: &Path, hash_all: bool, project: &Path, entry: Option<&Path>) -> Result<Located> {
     let project = crate::canonical(project)
         .with_context(|| format!("project directory {} does not exist", project.display()))?;
     let entry = match entry {
@@ -387,8 +391,8 @@ fn locate(project: &Path, entry: Option<&Path>) -> Result<Located> {
         "entry file {} does not exist",
         entry.display()
     );
-    let root = cache_dir().join("remotion");
-    let linked = !hash_all() && cache::links_work(&root);
+    let root = root.to_owned();
+    let linked = !hash_all && cache::links_work(&root);
     let key = input_hash(&project, &entry, !linked)?;
     let found = if linked {
         find_linked(&root, &key, &project)
@@ -436,6 +440,13 @@ fn remember_webgl(bundle: &Path, composition: &str) {
     let _ = fs::write(webgl_mark(bundle, composition), b"");
 }
 
+fn webgl_known(located: &Located, composition: &str) -> bool {
+    located
+        .found
+        .as_ref()
+        .is_some_and(|dir| webgl_mark(dir, composition).is_file())
+}
+
 /// Whether an earlier render of this composition found that its page uses WebGL. The answer
 /// is kept beside the bundle, so it is known before CEF starts and the render can begin on
 /// SwiftShader instead of aborting on the GPU first.
@@ -446,10 +457,7 @@ pub fn known_webgl(project: &Path, entry: Option<&Path>, composition: &str) -> b
     let Ok(located) = locate(project, entry) else {
         return false;
     };
-    let known = located
-        .found
-        .as_ref()
-        .is_some_and(|dir| webgl_mark(dir, composition).is_file());
+    let known = webgl_known(&located, composition);
     *REMEMBERED.lock().unwrap() = Some((project.to_owned(), entry.map(Path::to_owned), located));
     known
 }
@@ -1516,93 +1524,108 @@ pub(crate) fn colour(codec: Codec) -> ColourSpace {
 mod tests {
     use super::*;
 
+    struct Scratch {
+        project: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Result<Scratch> {
+            let dir = std::env::temp_dir().join(format!("vrf-{name}-{}", std::process::id()));
+            let _ = cache::remove(&dir);
+            let project = dir.join("project");
+            let bundler = project.join("node_modules/@remotion/bundler");
+            fs::create_dir_all(&bundler)?;
+            fs::create_dir_all(project.join("src"))?;
+            fs::create_dir_all(project.join("public/v"))?;
+            fs::write(bundler.join("package.json"), "{}")?;
+            fs::write(project.join("src/index.ts"), "")?;
+            fs::write(project.join("public/v/clip.mp4"), "clip")?;
+            Ok(Scratch {
+                project: crate::canonical(&project)?,
+                cache: dir.join("cache"),
+            })
+        }
+
+        fn locate(&self) -> Result<Located> {
+            locate_in(&self.cache, false, &self.project, None)
+        }
+
+        fn bundle(&self, files: &[PathBuf]) -> Result<PathBuf> {
+            let located = self.locate()?;
+            let name = format!(
+                "{}-{}",
+                located.key,
+                input_state(&located.key, &located.project, files)
+            );
+            let dir = located.root.join(name);
+            fs::create_dir_all(&dir)?;
+            fs::write(dir.join("index.html"), "")?;
+            fs::write(dir.join(INPUTS), serde_json::to_vec(files)?)?;
+            Ok(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if let Some(dir) = self.cache.parent() {
+                let _ = cache::remove(dir);
+            }
+        }
+    }
+
     #[test]
     fn a_composition_that_used_webgl_is_remembered_for_its_bundle() -> Result<()> {
-        let project = std::env::temp_dir().join(format!("vrf-known-webgl-{}", std::process::id()));
-        let bundler = project.join("node_modules/@remotion/bundler");
-        fs::create_dir_all(&bundler)?;
-        fs::create_dir_all(project.join("src"))?;
-        fs::write(bundler.join("package.json"), "{}")?;
-        fs::write(project.join("src/index.ts"), "")?;
-        let dir = fake_bundle(&project, &[project.join("src/index.ts")])?;
-        assert!(!known_webgl(&project, None, "Shader"));
+        let scratch = Scratch::new("known-webgl")?;
+        let source = scratch.project.join("src/index.ts");
+        let dir = scratch.bundle(std::slice::from_ref(&source))?;
+        assert!(!webgl_known(&scratch.locate()?, "Shader"));
         remember_webgl(&dir, "Shader");
-        assert!(known_webgl(&project, None, "Shader"));
-        assert!(!known_webgl(&project, None, "Other"));
-        fs::write(project.join("src/index.ts"), "changed")?;
-        assert!(!known_webgl(&project, None, "Shader"));
-        cache::remove(&dir)?;
-        fs::remove_dir_all(&project)?;
+        assert!(webgl_known(&scratch.locate()?, "Shader"));
+        assert!(!webgl_known(&scratch.locate()?, "Other"));
+        fs::write(&source, "changed")?;
+        assert!(!webgl_known(&scratch.locate()?, "Shader"));
         Ok(())
-    }
-
-    fn fake_project(name: &str) -> Result<PathBuf> {
-        let project = std::env::temp_dir().join(format!("vrf-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&project);
-        let bundler = project.join("node_modules/@remotion/bundler");
-        fs::create_dir_all(&bundler)?;
-        fs::create_dir_all(project.join("src"))?;
-        fs::create_dir_all(project.join("public/v"))?;
-        fs::write(bundler.join("package.json"), "{}")?;
-        fs::write(project.join("src/index.ts"), "")?;
-        fs::write(project.join("public/v/clip.mp4"), "clip")?;
-        Ok(crate::canonical(&project)?)
-    }
-
-    fn fake_bundle(project: &Path, files: &[PathBuf]) -> Result<PathBuf> {
-        let located = locate(project, None)?;
-        let name = format!(
-            "{}-{}",
-            located.key,
-            input_state(&located.key, &located.project, files)
-        );
-        let dir = located.root.join(name);
-        fs::create_dir_all(&dir)?;
-        fs::write(dir.join("index.html"), "")?;
-        fs::write(dir.join(INPUTS), serde_json::to_vec(files)?)?;
-        Ok(dir)
     }
 
     #[test]
     fn a_bundle_is_found_again_until_a_file_webpack_read_changes() -> Result<()> {
-        let project = fake_project("find")?;
+        let scratch = Scratch::new("find")?;
+        let project = &scratch.project;
         let source = project.join("src/index.ts");
         let data = project.join("samples/demo.json");
         fs::create_dir_all(data.parent().unwrap())?;
         fs::write(&data, "{}")?;
-        let dir = fake_bundle(&project, &[data.clone(), source.clone()])?;
-        assert_eq!(locate(&project, None)?.found.as_ref(), Some(&dir));
+        let dir = scratch.bundle(&[data.clone(), source.clone()])?;
+        assert_eq!(scratch.locate()?.found.as_ref(), Some(&dir));
         fs::write(project.join("public/v/clip.mp4"), "a longer clip")?;
         fs::write(project.join("public/new.png"), "png")?;
         fs::create_dir_all(project.join("work"))?;
         fs::write(project.join("work/props.json"), "{}")?;
         fs::write(project.join("render.mp4"), "out")?;
-        assert_eq!(locate(&project, None)?.found.as_ref(), Some(&dir));
+        assert_eq!(scratch.locate()?.found.as_ref(), Some(&dir));
         fs::write(&data, "{\"changed\":true}")?;
-        assert_eq!(locate(&project, None)?.found, None);
+        assert_eq!(scratch.locate()?.found, None);
         fs::write(&data, "{}")?;
-        let again = fake_bundle(&project, &[data.clone(), source.clone()])?;
+        scratch.bundle(&[data.clone(), source.clone()])?;
         fs::write(project.join("package.json"), "{}")?;
-        assert_eq!(locate(&project, None)?.found, None);
-        cache::remove(&dir)?;
-        cache::remove(&again)?;
-        fs::remove_dir_all(&project)?;
+        assert_eq!(scratch.locate()?.found, None);
         Ok(())
     }
 
     #[test]
     fn hashing_every_file_still_sees_public() -> Result<()> {
-        let project = fake_project("all")?;
+        let scratch = Scratch::new("all")?;
+        let project = scratch.project.as_path();
         let key = |project: &Path| input_hash(project, &project.join("src/index.ts"), true);
-        let before = key(&project)?;
+        let before = key(project)?;
         fs::write(project.join("public/v/clip.mp4"), "a longer clip")?;
-        assert_ne!(before, key(&project)?);
+        assert_ne!(before, key(project)?);
         let linked = |project: &Path| input_hash(project, &project.join("src/index.ts"), false);
-        let before = linked(&project)?;
+        let before = linked(project)?;
         fs::write(project.join("public/v/clip.mp4"), "an even longer clip")?;
         fs::write(project.join("src/index.ts"), "changed")?;
-        assert_eq!(before, linked(&project)?);
-        fs::remove_dir_all(&project)?;
+        assert_eq!(before, linked(project)?);
         Ok(())
     }
 
