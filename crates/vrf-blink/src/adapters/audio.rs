@@ -379,7 +379,9 @@ mod tests {
         volume_of_c: impl Fn(usize) -> f64,
         order: &[usize],
     ) -> (Option<AacStream>, Option<AacStream>) {
-        let dir = std::env::temp_dir().join(format!("vrf-live-audio-{}", std::process::id()));
+        static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("vrf-live-audio-{}-{run}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let wav = tone(&dir);
         let resolve = move |_: &str| Ok(wav.clone());
@@ -395,6 +397,7 @@ mod tests {
         let clips = remotion_clips(&all, FPS, resolve).unwrap();
         let early = live.finish(&clips).unwrap();
         let late = full_mix(&Predecoder::default(), &clips, samples, 128_000).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
         (early, late)
     }
 
