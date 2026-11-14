@@ -2,11 +2,11 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use ring::digest;
@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::Ui;
 use crate::adapters::hyperframes;
-use crate::adapters::remotion::{FrameAssets, RenderJob, Renderer, Report};
+use crate::adapters::remotion::{
+    FrameAssets, LoadedProject, Options, RenderJob, Renderer, Report, StillJob, StillReport,
+    WarmReport,
+};
 pub use transport::Stream;
 use transport::{Auth, Listener};
 
@@ -242,6 +245,42 @@ pub enum Job {
     Stop,
     Render(RenderJob),
     Hyperframes(hyperframes::RenderJob),
+    /// Writes single frames as images.
+    Still(StillJob),
+    /// Loads a project and leaves a ready view of its composition.
+    Warm(Options),
+    /// Answers at once, even during a render, with what the daemon is and holds.
+    Status,
+}
+
+impl Job {
+    fn renders(&self) -> bool {
+        matches!(
+            self,
+            Job::Render(_) | Job::Hyperframes(_) | Job::Still(_) | Job::Warm(_)
+        )
+    }
+}
+
+/// What a running daemon is and holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Status {
+    pub build: String,
+    pub pid: u32,
+    /// `reference` rasterises on the CPU, `fast` on the GPU.
+    pub mode: String,
+    pub software_webgl: bool,
+    pub hot_props: bool,
+    pub socket: PathBuf,
+    pub uptime_s: f64,
+    pub idle_timeout_s: f64,
+    /// Seconds since the last job finished, or since the start.
+    pub idle_s: f64,
+    pub jobs_done: u64,
+    pub busy: bool,
+    pub waiting: usize,
+    pub projects_kept: usize,
+    pub loaded: Vec<LoadedProject>,
 }
 
 /// One line of JSON from client to daemon.
@@ -287,6 +326,15 @@ enum Event {
     DoneHyperframes {
         report: Box<hyperframes::Report>,
     },
+    DoneStill {
+        report: Box<StillReport>,
+    },
+    Warmed {
+        report: Box<WarmReport>,
+    },
+    Status {
+        status: Box<Status>,
+    },
     Pong,
     Refused {
         reason: String,
@@ -306,6 +354,9 @@ fn send(mut stream: &Stream, event: &Event) -> std::io::Result<()> {
 pub enum Reply {
     Rendered(Box<Report>, Vec<FrameAssets>),
     RenderedHyperframes(Box<hyperframes::Report>),
+    Still(Box<StillReport>),
+    Warmed(Box<WarmReport>),
+    Status(Box<Status>),
     Pong,
     /// The daemon will not serve this request, such as one from another build. Render in
     /// process instead.
@@ -375,6 +426,9 @@ pub fn call(
             Event::Progress { frame, frames } => progress(frame, frames),
             Event::Done { report, assets } => return Ok(Reply::Rendered(report, assets)),
             Event::DoneHyperframes { report } => return Ok(Reply::RenderedHyperframes(report)),
+            Event::DoneStill { report } => return Ok(Reply::Still(report)),
+            Event::Warmed { report } => return Ok(Reply::Warmed(report)),
+            Event::Status { status } => return Ok(Reply::Status(status)),
             Event::Pong => return Ok(Reply::Pong),
             Event::Refused { reason } => return Ok(Reply::Refused(reason)),
             Event::Failed { message } => bail!("{message}"),
@@ -390,6 +444,29 @@ pub struct Config {
     pub cpu_raster: bool,
     /// How many projects keep their bundle and frame server.
     pub projects: usize,
+    /// Whether a render with new props reuses a loaded page of the same composition.
+    pub hot_props: bool,
+}
+
+struct Snapshot {
+    status: Status,
+    started: Instant,
+    idle_since: Instant,
+}
+
+impl Snapshot {
+    fn now(&self, waiting: usize) -> Status {
+        Status {
+            uptime_s: self.started.elapsed().as_secs_f64(),
+            idle_s: if self.status.busy {
+                0.0
+            } else {
+                self.idle_since.elapsed().as_secs_f64()
+            },
+            waiting,
+            ..self.status.clone()
+        }
+    }
 }
 
 struct Queued {
@@ -414,6 +491,7 @@ fn accept(
     pending: Arc<AtomicUsize>,
     jobs: mpsc::Sender<Queued>,
     stopping: Arc<AtomicBool>,
+    snapshot: Arc<Mutex<Snapshot>>,
 ) {
     let auth = Auth::of(&listener);
     for stream in transport::incoming(&listener, &stopping) {
@@ -423,6 +501,7 @@ fn accept(
         let Ok(stream) = stream else { continue };
         let (build, pending, jobs) = (build.clone(), pending.clone(), jobs.clone());
         let auth = auth.clone();
+        let snapshot = snapshot.clone();
         thread::spawn(move || {
             let Ok(copy) = stream.try_clone() else { return };
             let mut reader = BufReader::new(copy);
@@ -453,7 +532,16 @@ fn accept(
                     return;
                 }
             };
-            let renders = matches!(request.job, Job::Render(_) | Job::Hyperframes(_));
+            if matches!(request.job, Job::Status) {
+                let busy = snapshot.lock().unwrap().status.busy;
+                let waiting = pending
+                    .load(Ordering::SeqCst)
+                    .saturating_sub(usize::from(busy));
+                let status = Box::new(snapshot.lock().unwrap().now(waiting));
+                let _ = send(&stream, &Event::Status { status });
+                return;
+            }
+            let renders = request.job.renders();
             let refusal = if renders && request.build != build {
                 Some(format!(
                     "the daemon is build {build} and the client is {}; restart the daemon",
@@ -546,6 +634,32 @@ fn render_hyperframes(
     })
 }
 
+fn still(
+    renderer: &mut Renderer,
+    ui: &Ui,
+    job: StillJob,
+    command_start: SystemTime,
+    stream: &Stream,
+) -> Event {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        renderer.still(ui, &job, command_start, &mut |frame, frames| {
+            send(stream, &Event::Progress { frame, frames }).context("the client went away")
+        })
+    }));
+    finish(renderer, outcome, |report| Event::DoneStill {
+        report: Box::new(report),
+    })
+}
+
+fn warm(renderer: &mut Renderer, ui: &Ui, options: Options, command_start: SystemTime) -> Event {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        renderer.warm(ui, &options, command_start)
+    }));
+    finish(renderer, outcome, |report| Event::Warmed {
+        report: Box::new(report),
+    })
+}
+
 /// Serves render requests on `config.socket` until it has been idle for `config.idle`, or a
 /// [`Job::Stop`] arrives. CEF, the GPU state and pixel pools, and the last projects' bundles,
 /// frame servers and ready views stay loaded between requests. One render runs at a time and
@@ -554,16 +668,47 @@ pub fn serve(ui: &Ui, config: &Config) -> Result<()> {
     let listener = transport::bind(&config.socket)?;
     let build = build_id()?;
     let mut renderer = Renderer::new(config.projects);
+    renderer.set_hot_props(config.hot_props);
     renderer.prepare()?;
+    let started = Instant::now();
+    let snapshot = Arc::new(Mutex::new(Snapshot {
+        status: Status {
+            build: build.clone(),
+            pid: std::process::id(),
+            mode: if config.cpu_raster {
+                "reference"
+            } else {
+                "fast"
+            }
+            .to_owned(),
+            software_webgl: crate::software_webgl(),
+            hot_props: config.hot_props,
+            socket: config.socket.clone(),
+            uptime_s: 0.0,
+            idle_timeout_s: config.idle.as_secs_f64(),
+            idle_s: 0.0,
+            jobs_done: 0,
+            busy: false,
+            waiting: 0,
+            projects_kept: config.projects,
+            loaded: Vec::new(),
+        },
+        started,
+        idle_since: started,
+    }));
 
     eprintln!("strobe daemon: ready on {}", config.socket.display());
     let pending = Arc::new(AtomicUsize::new(0));
     let stopping = Arc::new(AtomicBool::new(false));
     let (jobs, queue) = mpsc::channel();
     let acceptor = {
-        let (pending, stopping) = (pending.clone(), stopping.clone());
+        let (pending, stopping, snapshot) = (pending.clone(), stopping.clone(), snapshot.clone());
         let (build, cpu_raster) = (build, config.cpu_raster);
-        thread::spawn(move || accept(listener, build, cpu_raster, pending, jobs, stopping))
+        thread::spawn(move || {
+            accept(
+                listener, build, cpu_raster, pending, jobs, stopping, snapshot,
+            )
+        })
     };
 
     let result = loop {
@@ -573,6 +718,7 @@ pub fn serve(ui: &Ui, config: &Config) -> Result<()> {
             Err(RecvTimeoutError::Disconnected) => break Err(anyhow::anyhow!("the acceptor died")),
         };
         let command_start = UNIX_EPOCH + Duration::from_micros(request.command_start_us);
+        snapshot.lock().unwrap().status.busy = true;
         let mut stop = false;
         let reply = match request.job {
             Job::Ping => Event::Pong,
@@ -584,6 +730,11 @@ pub fn serve(ui: &Ui, config: &Config) -> Result<()> {
             Job::Hyperframes(job) => {
                 render_hyperframes(&mut renderer, ui, job, command_start, &stream)
             }
+            Job::Still(job) => still(&mut renderer, ui, job, command_start, &stream),
+            Job::Warm(options) => warm(&mut renderer, ui, options, command_start),
+            Job::Status => Event::Status {
+                status: Box::new(snapshot.lock().unwrap().now(0)),
+            },
         };
         let _ = send(&stream, &reply);
         drop(stream);
@@ -594,6 +745,11 @@ pub fn serve(ui: &Ui, config: &Config) -> Result<()> {
         if let Err(error) = renderer.refill(ui) {
             eprintln!("strobe daemon: cannot open a spare view: {error:#}");
         }
+        let mut state = snapshot.lock().unwrap();
+        state.status.busy = false;
+        state.status.jobs_done += 1;
+        state.status.loaded = renderer.loaded();
+        state.idle_since = Instant::now();
     };
 
     stopping.store(true, Ordering::Release);
@@ -607,6 +763,16 @@ pub fn serve(ui: &Ui, config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stills_and_warming_are_renders_and_a_status_is_not() {
+        assert!(!Job::Status.renders());
+        assert!(!Job::Ping.renders());
+        assert!(!Job::Stop.renders());
+        assert_eq!(serde_json::to_string(&Job::Status).unwrap(), "\"Status\"");
+        let status: Job = serde_json::from_str("\"Status\"").unwrap();
+        assert!(matches!(status, Job::Status));
+    }
 
     #[test]
     fn a_request_line_has_a_size_limit() {

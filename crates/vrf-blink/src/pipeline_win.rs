@@ -63,6 +63,16 @@ impl Warm {
     }
 
     pub fn keep(&mut self, _: Keep, _: Converting) {}
+
+    /// Copies a delivered paint out of CEF's texture: its bytes, row width and format.
+    pub fn read_paint(&self, paint: &Paint) -> Result<(Vec<u8>, u32, wgpu::TextureFormat)> {
+        let texture = self.gpu.import_shared_handle(
+            &paint.surface,
+            wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
+        )?;
+        let bytes = self.gpu.read_texture(&texture)?;
+        Ok((bytes, texture.width(), texture.format()))
+    }
 }
 
 pub struct Started {
