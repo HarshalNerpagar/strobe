@@ -53,6 +53,28 @@
     return target - pts[before] < pts[before + 1] - target ? before : before + 1;
   };
 
+  const chooseFrameAtOrBefore = (pts, ticks) => {
+    const target = ticks + 1e-3;
+    let low = 0;
+    let high = pts.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (pts[mid] <= target) low = mid + 1;
+      else high = mid;
+    }
+    return Math.max(0, low - 1);
+  };
+
+  const AT_OR_BEFORE_SINCE = [4, 0, 506];
+  const frameRule = (version) => {
+    const parts = String(version ?? '').split(/[.-]/).slice(0, 3).map(Number);
+    if (parts.length < 3 || parts.some(Number.isNaN)) return chooseFrame;
+    for (let i = 0; i < 3; i++) {
+      if (parts[i] !== AT_OR_BEFORE_SINCE[i]) return parts[i] > AT_OR_BEFORE_SINCE[i] ? chooseFrameAtOrBefore : chooseFrame;
+    }
+    return chooseFrameAtOrBefore;
+  };
+
   const send = (message) => globalThis.__vrf_video_send(JSON.stringify(message));
 
   let fallbackInfo = null;
@@ -303,7 +325,7 @@
   const request = async (src, time) => {
     const clip = await open(src);
     if (!clip) return null;
-    const k = chooseFrame(clip.pts, time * clip.timescale);
+    const k = frameRule(globalThis.__vrf_rm_config?.remotionVersion)(clip.pts, time * clip.timescale);
     const [picture, bytes] = await Promise.all([frame(clip, k), placeholder()]);
     const tag = { clip, k, picture };
     const response = new Response(null, { status: 200, headers: { 'Content-Type': 'image/png' } });
@@ -357,6 +379,8 @@
     fallback: () => fallbackInfo,
     refusal: () => lastRefusal,
     chooseFrame,
+    chooseFrameAtOrBefore,
+    frameRule,
     swsRgb,
     swsConfig,
     frame,

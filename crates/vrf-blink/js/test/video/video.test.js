@@ -46,6 +46,42 @@ test('every output frame of a constant frame rate clip shows its own frame', () 
   for (let frame = 0; frame < 120; frame++) assert.equal(chooseFrame(CFR, (frame / 30) * 15360), frame, `frame ${frame}`);
 });
 
+const { chooseFrameAtOrBefore, frameRule } = globalThis.__vrf.video;
+
+test("Remotion 4.0.506 and later show the last frame at or before the time (probed on 25 and 29.97 fps clips)", () => {
+  const remotion = {
+    25: [5, 5, 6, 7, 8, 9, 10, 10, 11, 12, 13, 14, 15, 15, 16, 17, 18, 19, 20, 20, 21, 22, 23, 24, 25, 25, 26, 27, 28, 29],
+    29.97: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34],
+  };
+  const tracks = { 25: [12800, 512], 29.97: [30000, 1001] };
+  for (const [rate, shown] of Object.entries(remotion)) {
+    const [timescale, step] = tracks[rate];
+    const pts = Array.from({ length: 90 }, (_, i) => i * step);
+    for (const [i, index] of shown.entries()) {
+      const frame = i + 6;
+      assert.equal(chooseFrameAtOrBefore(pts, (frame / 30) * timescale), index, `${rate} fps, output frame ${frame}`);
+    }
+  }
+});
+
+test('a time on a frame shows that frame even when the product rounds just below it', () => {
+  assert.equal(chooseFrameAtOrBefore([0, 512, 1024], 1023.9999999), 2);
+  assert.equal(chooseFrameAtOrBefore([0, 512, 1024], 1023.9), 1);
+  assert.equal(chooseFrameAtOrBefore([23040, 23552], 0), 0);
+  assert.equal(chooseFrameAtOrBefore(CFR, 1e9), CFR.length - 1);
+});
+
+test('the frame rule follows the Remotion version, and an unknown version keeps the nearest frame', () => {
+  assert.equal(frameRule('4.0.541'), chooseFrameAtOrBefore);
+  assert.equal(frameRule('4.0.506'), chooseFrameAtOrBefore);
+  assert.equal(frameRule('4.1.0'), chooseFrameAtOrBefore);
+  assert.equal(frameRule('5.0.0-alpha.1'), chooseFrameAtOrBefore);
+  assert.equal(frameRule('4.0.505'), chooseFrame);
+  assert.equal(frameRule('3.3.100'), chooseFrame);
+  assert.equal(frameRule(undefined), chooseFrame);
+  assert.equal(frameRule('next'), chooseFrame);
+});
+
 const oracle = JSON.parse(fs.readFileSync(path.join(__dirname, 'swscale-oracle.json'), 'utf8'));
 const matrixOf = (tag) => [tag.replace('f', ''), tag.endsWith('f')];
 

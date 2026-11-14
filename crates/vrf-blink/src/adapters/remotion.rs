@@ -617,6 +617,12 @@ struct Native {
     fallback: Arc<Fallback>,
 }
 
+fn remotion_version(project: &Path) -> Option<String> {
+    let text = fs::read_to_string(project.join("node_modules/remotion/package.json")).ok()?;
+    let package: Value = serde_json::from_str(&text).ok()?;
+    package["version"].as_str().map(str::to_owned)
+}
+
 /// A bundled project that can open ready-to-seek views of one composition.
 pub struct Page {
     project: Project,
@@ -636,6 +642,7 @@ impl Page {
             "inputProps": options.props.as_deref().unwrap_or("{}"),
             "timeoutInMilliseconds": options.timeout.as_millis() as u64,
             "captureMode": "raw",
+            "remotionVersion": remotion_version(&options.project),
         });
         Ok(Page {
             project,
