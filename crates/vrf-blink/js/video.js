@@ -322,24 +322,74 @@
   const pool = [];
   let shown = [];
 
-  const request = async (src, time) => {
-    const clip = await open(src);
-    if (!clip) return null;
-    const k = frameRule(globalThis.__vrf_rm_config?.remotionVersion)(clip.pts, time * clip.timescale);
-    const [picture, bytes] = await Promise.all([frame(clip, k), placeholder()]);
-    const tag = { clip, k, picture };
-    const response = new Response(null, { status: 200, headers: { 'Content-Type': 'image/png' } });
-    response.blob = async () => {
-      const blob = new Blob([bytes], { type: 'image/png' });
-      tagged.set(blob, tag);
-      return blob;
-    };
-    response.arrayBuffer = async () => {
-      const copy = bytes.slice(0);
-      taggedBuffers.set(copy, tag);
-      return copy;
-    };
-    return response;
+  // A fetch aborted by its signal must reject with an AbortError, as Chrome's does, before the response and while its body is read.
+  // Remotion's OffthreadVideo clears its delayRender() handle only on that rejection or once the image is set, so a request that
+  // ignored the abort of an unmounted video left the handle open until the render timed out.
+  let abortedRequests = 0;
+  const aborted = (signal) => {
+    abortedRequests++;
+    return signal.reason ?? new DOMException('signal is aborted without reason', 'AbortError');
+  };
+  const unlessAborted = (promise, signal) => {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(aborted(signal));
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(aborted(signal));
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(
+        (value) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(value);
+        },
+        (error) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
+  };
+
+  const inFlight = new Map();
+  let nextFlight = 1;
+
+  const request = async (src, time, signal) => {
+    const id = nextFlight++;
+    inFlight.set(id, { src, time, k: null, since: performance.now() });
+    try {
+      const clip = await unlessAborted(open(src), signal);
+      if (!clip) return null;
+      const k = frameRule(globalThis.__vrf_rm_config?.remotionVersion)(clip.pts, time * clip.timescale);
+      inFlight.get(id).k = k;
+      const [picture, bytes] = await unlessAborted(Promise.all([frame(clip, k), placeholder()]), signal);
+      const tag = { clip, k, picture };
+      const response = new Response(null, { status: 200, headers: { 'Content-Type': 'image/png' } });
+      response.blob = async () => {
+        if (signal?.aborted) throw aborted(signal);
+        const blob = new Blob([bytes], { type: 'image/png' });
+        tagged.set(blob, tag);
+        return blob;
+      };
+      response.arrayBuffer = async () => {
+        if (signal?.aborted) throw aborted(signal);
+        const copy = bytes.slice(0);
+        taggedBuffers.set(copy, tag);
+        return copy;
+      };
+      return response;
+    } finally {
+      inFlight.delete(id);
+    }
+  };
+
+  // One line for a render error: which native requests are still waiting, and whether the frame server had to start.
+  const diagnose = () => {
+    const now = performance.now();
+    const waiting = [...inFlight.values()].map(({ src, time, k, since }) => {
+      const name = decodeURIComponent(String(src).split('/').pop());
+      return `${name} t=${time}${k === null ? ' (opening)' : ` frame ${k}`} for ${Math.round(now - since)} ms`;
+    });
+    const fallback = fallbackInfo ? `frame server on port ${fallbackInfo.port}` : 'frame server not started';
+    return `strobe native video: ${waiting.length} request(s) in flight${waiting.length ? ` [${waiting.slice(0, 4).join('; ')}]` : ''}, ${abortedRequests} aborted, ${fallback}${lastRefusal ? `, last refusal: ${lastRefusal}` : ''}`;
   };
 
   const present = () => {
@@ -378,6 +428,8 @@
     present,
     fallback: () => fallbackInfo,
     refusal: () => lastRefusal,
+    diagnose,
+    inFlight,
     chooseFrame,
     chooseFrameAtOrBefore,
     frameRule,

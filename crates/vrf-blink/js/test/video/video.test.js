@@ -257,3 +257,84 @@ test('blobs the page builds itself are untouched and still Blobs', async () => {
   assert.equal(globalThis.__vrf.video.sources.has(url), false);
   URL.revokeObjectURL(url);
 });
+
+// Remotion's OffthreadVideo aborts its fetch when the video unmounts or its frame changes, and clears its delayRender() handle only
+// when that fetch rejects with an AbortError (or once the image is set). A native request that ignored the abort left the handle
+// open: "A delayRender() "Fetching http://localhost:0/proxy?..." was called but not cleared" (Nvidia Short #1 v6.2, 2026-11-15).
+const withHeldFrames = async (body) => {
+  const held = [];
+  await withVideoPage(async (images) => {
+    const send = globalThis.__vrf_video_send;
+    globalThis.__vrf_video_send = (json) => {
+      const message = JSON.parse(json);
+      if (message.t === 'want') held.push(message);
+      else send(json);
+    };
+    const release = () => {
+      for (const message of held.splice(0)) if (!message.hit) globalThis.__vrf_video_push(frameBuffer(message.clip, message.k));
+    };
+    await body({ images, release, held });
+  });
+};
+
+test('a request aborted while its frame is being decoded rejects with an AbortError', async () => {
+  await withHeldFrames(async ({ release }) => {
+    const controller = new AbortController();
+    const pending = globalThis.__vrf.video.request('abort-a.mp4', 2, controller.signal);
+    await new Promise((r) => setTimeout(r, 5));
+    assert.match(globalThis.__vrf.video.diagnose(), /1 request\(s\) in flight \[abort-a\.mp4 t=2 frame 2/);
+    controller.abort();
+    await assert.rejects(pending, (error) => error.name === 'AbortError' && /aborted/.test(error.message));
+    release();
+    assert.match(globalThis.__vrf.video.diagnose(), /0 request\(s\) in flight, \d+ aborted/);
+  });
+});
+
+test('a request whose signal is already aborted rejects at once', async () => {
+  await withHeldFrames(async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(globalThis.__vrf.video.request('abort-b.mp4', 1, controller.signal), { name: 'AbortError' });
+  });
+});
+
+test('reading the body of an aborted response rejects, as a fetch body does', async () => {
+  await withVideoPage(async () => {
+    const controller = new AbortController();
+    const res = await globalThis.__vrf.video.request('abort-c.mp4', 3, controller.signal);
+    controller.abort();
+    await assert.rejects(res.arrayBuffer(), { name: 'AbortError' });
+    await assert.rejects(res.blob(), { name: 'AbortError' });
+  });
+});
+
+test('a request that was not aborted resolves and shows its frame, and an abort after it is harmless', async () => {
+  await withHeldFrames(async ({ images, release }) => {
+    const controller = new AbortController();
+    const pending = globalThis.__vrf.video.request('abort-d.mp4', 4, controller.signal);
+    await new Promise((r) => setTimeout(r, 5));
+    release();
+    const res = await pending;
+    const blob = new Blob([await res.arrayBuffer()], { type: 'image/png' });
+    controller.abort();
+    const url = URL.createObjectURL(blob);
+    assert.equal(globalThis.__vrf.video.sources.get(url)?.k, 4);
+    showImage(images, url);
+    assert.equal(globalThis.__vrf.video.present(), 1);
+  });
+});
+
+test('an aborted request does not stop a later request for the same frame', async () => {
+  await withHeldFrames(async ({ release }) => {
+    const first = new AbortController();
+    const aborted = globalThis.__vrf.video.request('abort-e.mp4', 5, first.signal);
+    await new Promise((r) => setTimeout(r, 5));
+    first.abort();
+    await assert.rejects(aborted, { name: 'AbortError' });
+    const again = globalThis.__vrf.video.request('abort-e.mp4', 5, new AbortController().signal);
+    await new Promise((r) => setTimeout(r, 5));
+    release();
+    const res = await again;
+    assert.equal(res.status, 200);
+  });
+});

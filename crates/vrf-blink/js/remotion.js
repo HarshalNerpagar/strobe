@@ -29,13 +29,15 @@ globalThis.process.env.NODE_ENV = 'production';
     const nativeFetch = globalThis.fetch.bind(globalThis);
     const proxy = /^http:\/\/localhost:\d+\/proxy\?/;
     globalThis.fetch = async (input, init) => {
-      if (typeof input === 'string' && proxy.test(input)) {
-        const url = new URL(input);
+      const href = typeof input === 'string' ? input : input instanceof URL ? input.href : null;
+      if (href !== null && proxy.test(href)) {
+        const url = new URL(href);
         const time = Math.max(0, Number(url.searchParams.get('time')));
         url.searchParams.set('time', String(time));
         let { serveUrl } = config;
         if (config.nativeVideo) {
-          const response = await globalThis.__vrf.video.request(url.searchParams.get('src'), time);
+          // The URL's port is Remotion's window.remotion_proxyPort, 0 while no frame server runs: this branch answers it.
+          const response = await globalThis.__vrf.video.request(url.searchParams.get('src'), time, init?.signal);
           if (response) return response;
           const fallback = globalThis.__vrf.video.fallback();
           if (!fallback) throw new Error(`cannot decode ${url.searchParams.get('src')}: ${globalThis.__vrf.video.refusal()}`);
@@ -130,6 +132,13 @@ globalThis.process.env.NODE_ENV = 'production';
     }, PUMP_MS);
   };
 
+  // A render error about a frame request gets the native video path's state, so a stuck request is told apart from a refused clip.
+  const withVideoState = (error) => {
+    const text = String(error);
+    const video = globalThis.__vrf?.video;
+    return video?.diagnose && /\/proxy\?/.test(text) ? `${text} (${video.diagnose()})` : text;
+  };
+
   const waitReady = (frame) =>
     new Promise((resolve, reject) => {
       let settling = false;
@@ -146,8 +155,8 @@ globalThis.process.env.NODE_ENV = 'production';
         done(reject, new Error(`Timeout exceeded rendering the component${where}. ${handles ? `Open delayRender() handles: ${handles}` : ''}`));
       }, config.timeoutInMilliseconds + 3000);
       const check = async () => {
-        if (pageErrors.length) return done(reject, new Error(pageErrors.shift()));
-        if (cancelledError !== undefined) return done(reject, new Error(cancelledError));
+        if (pageErrors.length) return done(reject, new Error(withVideoState(pageErrors.shift())));
+        if (cancelledError !== undefined) return done(reject, new Error(withVideoState(cancelledError)));
         if (renderReady !== true || settling) return;
         settling = true;
         await macrotask();
