@@ -184,6 +184,10 @@ struct DaemonArgs {
     /// the page the new props and mounts the composition again, instead of loading a new page.
     #[arg(long)]
     hot_props: bool,
+    /// The file this daemon's output goes to, which `--status` reports. Set by the client that
+    /// starts the daemon in the background.
+    #[arg(long, hide = true)]
+    log: Option<PathBuf>,
 }
 
 impl DaemonArgs {
@@ -661,13 +665,15 @@ fn spawn_daemon(cpu_raster: bool, socket: &Path, extra: &[String]) -> Option<Str
     if vrf_blink::software_webgl() {
         command.env(SOFTWARE_WEBGL, "1");
     }
-    let mut child = daemon::spawn_detached(&mut command).ok()?;
+    let log = daemon::log_path(socket);
+    command.arg("--log").arg(&log);
+    let mut child = daemon::spawn_detached(&mut command, &log).ok()?;
     let deadline = Instant::now() + DAEMON_START;
     loop {
         if let Some(stream) = daemon::connect(socket) {
             return Some(stream);
         }
-        if child.try_wait().ok()?.is_some() || Instant::now() > deadline {
+        if child.exited() || Instant::now() > deadline {
             return None;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1072,6 +1078,9 @@ fn run_warm(args: WarmArgs, cpu_raster: bool, command_start: SystemTime) -> Resu
     };
     let mut how = served(cpu_raster, Some(socket.as_path()), None);
     how["started"] = Value::Bool(started);
+    if started {
+        how["log"] = json!(daemon::log_path(&socket));
+    }
     if args.page.json {
         print_json(&with_daemon(serde_json::to_value(&report)?, &how));
     } else {
@@ -1134,6 +1143,7 @@ fn main() -> ExitCode {
                 cpu_raster,
                 projects: args.projects,
                 hot_props: args.hot_props,
+                log: args.log,
             };
             vrf_blink::run(move |ui| daemon::serve(&ui, &config))
         }

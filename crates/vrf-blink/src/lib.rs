@@ -6,6 +6,7 @@ mod bitmap;
 mod bundle;
 pub mod calibration;
 pub mod daemon;
+mod detach;
 pub mod driver;
 #[cfg(target_os = "macos")]
 mod mac;

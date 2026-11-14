@@ -18,6 +18,7 @@ use crate::adapters::remotion::{
     FrameAssets, LoadedProject, Options, RenderJob, Renderer, Report, StillJob, StillReport,
     WarmReport,
 };
+pub use crate::detach::{Detached, spawn_detached};
 pub use transport::Stream;
 use transport::{Auth, Listener};
 
@@ -207,6 +208,17 @@ fn socket_in(base: Option<std::ffi::OsString>, cpu_raster: bool, software_webgl:
     }
 }
 
+/// Where a daemon that a client starts in the background writes its output: a file named after
+/// its socket in the `daemon` directory of the cache.
+pub fn log_path(socket: &Path) -> PathBuf {
+    let name = socket
+        .file_stem()
+        .map_or_else(|| "vrf-daemon".into(), |stem| stem.to_os_string());
+    let mut file = name;
+    file.push(".log");
+    crate::adapters::cache_dir().join("daemon").join(file)
+}
+
 /// The socket of this process's modes.
 pub fn socket_path() -> PathBuf {
     socket_for(crate::cpu_raster(), crate::software_webgl())
@@ -272,6 +284,9 @@ pub struct Status {
     pub software_webgl: bool,
     pub hot_props: bool,
     pub socket: PathBuf,
+    /// The file the daemon's output goes to, if it was started with one.
+    #[serde(default)]
+    pub log: Option<PathBuf>,
     pub uptime_s: f64,
     pub idle_timeout_s: f64,
     /// Seconds since the last job finished, or since the start.
@@ -365,34 +380,6 @@ pub enum Reply {
     Gone,
 }
 
-/// Starts `command` as a process that outlives this one, with no console and no handle of this
-/// process's: a Windows child inherits this process's pipes, and a caller reading them would
-/// wait for the child to exit.
-pub fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
-    use std::process::Stdio;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(command, 0);
-    #[cfg(windows)]
-    {
-        use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation};
-        use windows::Win32::System::Console::{
-            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-        };
-        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-            if let Ok(handle) = unsafe { GetStdHandle(id) } {
-                let _ =
-                    unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) };
-            }
-        }
-        std::os::windows::process::CommandExt::creation_flags(command, 0x0000_0208);
-    }
-    command.spawn()
-}
-
 /// Connects to the daemon at `socket`, if one is listening.
 pub fn connect(socket: &Path) -> Option<Stream> {
     transport::connect(socket)
@@ -446,6 +433,8 @@ pub struct Config {
     pub projects: usize,
     /// Whether a render with new props reuses a loaded page of the same composition.
     pub hot_props: bool,
+    /// The file this daemon's output goes to, reported by its status.
+    pub log: Option<PathBuf>,
 }
 
 struct Snapshot {
@@ -684,6 +673,7 @@ pub fn serve(ui: &Ui, config: &Config) -> Result<()> {
             software_webgl: crate::software_webgl(),
             hot_props: config.hot_props,
             socket: config.socket.clone(),
+            log: config.log.clone(),
             uptime_s: 0.0,
             idle_timeout_s: config.idle.as_secs_f64(),
             idle_s: 0.0,
@@ -772,6 +762,16 @@ mod tests {
         assert_eq!(serde_json::to_string(&Job::Status).unwrap(), "\"Status\"");
         let status: Job = serde_json::from_str("\"Status\"").unwrap();
         assert!(matches!(status, Job::Status));
+    }
+
+    #[test]
+    fn a_daemon_log_is_named_after_its_socket_in_the_cache() {
+        let log = log_path(&std::env::temp_dir().join("vrf-daemon-fast.port"));
+        assert_eq!(log.file_name().unwrap(), "vrf-daemon-fast.log");
+        assert_eq!(
+            log.parent().unwrap(),
+            crate::adapters::cache_dir().join("daemon")
+        );
     }
 
     #[test]

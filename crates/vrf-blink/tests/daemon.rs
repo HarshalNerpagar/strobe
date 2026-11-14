@@ -36,6 +36,7 @@ fn start(ui: &Ui, tag: &str, idle: Duration) -> Result<Daemon> {
         cpu_raster: true,
         projects: 2,
         hot_props: false,
+        log: None,
     };
     let ui = ui.clone();
     let thread = thread::spawn(move || daemon::serve(&ui, &config));
