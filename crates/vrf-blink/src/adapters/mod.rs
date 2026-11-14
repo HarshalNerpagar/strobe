@@ -19,6 +19,7 @@ use vrf_encode::{AacConfig, AacStream, Rational};
 use crate::driver::Summary;
 
 mod audio;
+mod cache;
 pub mod hyperframes;
 pub mod remotion;
 

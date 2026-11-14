@@ -20,8 +20,8 @@ use vrf_encode::{Codec, ColourSpace, Matrix, Range, Rational};
 
 use super::hyperframes;
 use super::{
-    PerFrame, Progress, StageStats, add_track, audio_samples, cache_dir, contained_join, hash_tree,
-    partial_path, short_hex, since, write_if_changed,
+    PerFrame, Progress, StageStats, add_track, audio_samples, cache, cache_dir, contained_join,
+    hash_tree, partial_path, short_hex, since, write_if_changed,
 };
 use crate::adapters::audio::LiveAudio;
 use crate::driver::{Config, Plan, Runs, Warm, render_runs};
@@ -55,6 +55,17 @@ const REMOTION_COMMANDS: [&str; 6] = [
     "compositions",
 ];
 const RETRY_MARK: &str = "Rendering the frame will be retried";
+const INPUTS: &str = "vrf-inputs.json";
+const EMPTY_PUBLIC: &str = "empty-public";
+const ROOT_INPUTS: [&str; 7] = [
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "tsconfig.json",
+];
 const AUDIO_BIT_RATE: u32 = 320_000;
 
 /// What decodes the frames of `<OffthreadVideo>`.
@@ -217,9 +228,15 @@ fn find_entry(project: &Path) -> Result<PathBuf> {
         })
 }
 
-fn input_hash(project: &Path, entry: &Path) -> Result<String> {
+fn hash_all() -> bool {
+    std::env::var_os("VRF_HASH_ALL").is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+fn input_hash(project: &Path, entry: &Path, all: bool) -> Result<String> {
     let mut context = digest::Context::new(&digest::SHA256);
-    hash_tree(&mut context, project, project)?;
+    if all {
+        hash_tree(&mut context, project, project)?;
+    }
     context.update(entry.as_os_str().as_encoded_bytes());
     context.update(BUNDLE_JS.as_bytes());
     let bundler = project.join("node_modules/@remotion/bundler/package.json");
@@ -232,12 +249,77 @@ fn input_hash(project: &Path, entry: &Path) -> Result<String> {
     Ok(short_hex(context))
 }
 
+fn read_inputs(bundle: &Path) -> Result<Vec<PathBuf>> {
+    Ok(serde_json::from_slice(&fs::read(bundle.join(INPUTS))?)?)
+}
+
+fn input_state(key: &str, project: &Path, files: &[PathBuf]) -> String {
+    let mut context = digest::Context::new(&digest::SHA256);
+    context.update(key.as_bytes());
+    let root = ROOT_INPUTS.iter().map(|name| project.join(name));
+    for file in files.iter().cloned().chain(root) {
+        context.update(file.as_os_str().as_encoded_bytes());
+        context.update(&[0]);
+        match fs::metadata(&file).and_then(|metadata| Ok((metadata.len(), metadata.modified()?))) {
+            Ok((len, modified)) => {
+                let modified = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                context.update(&len.to_le_bytes());
+                context.update(&modified.to_le_bytes());
+            }
+            Err(_) => context.update(b"missing"),
+        }
+    }
+    short_hex(context)
+}
+
+fn changed_since(files: &[PathBuf], start: SystemTime) -> bool {
+    files.iter().any(|file| {
+        fs::metadata(file)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified > start)
+    })
+}
+
+fn is_bundle_name(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('-').collect();
+    (1..=2).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|part| part.len() == 16 && part.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn find_linked(root: &Path, key: &str, project: &Path) -> Option<PathBuf> {
+    let prefix = format!("{key}-");
+    let mut candidates: Vec<PathBuf> = fs::read_dir(root)
+        .ok()?
+        .filter_map(|item| item.ok())
+        .filter(|item| {
+            let name = item.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(&prefix) && is_bundle_name(&name)
+        })
+        .map(|item| item.path())
+        .collect();
+    candidates.sort_by_key(|dir| std::cmp::Reverse(cache::last_used(dir)));
+    candidates.into_iter().find(|dir| {
+        dir.join("index.html").is_file()
+            && read_inputs(dir).is_ok_and(|files| {
+                let name = format!("{key}-{}", input_state(key, project, &files));
+                dir.file_name() == Some(std::ffi::OsStr::new(&name))
+            })
+    })
+}
+
 struct Located {
     project: PathBuf,
     entry: PathBuf,
-    hash: String,
+    key: String,
+    linked: bool,
     root: PathBuf,
-    dir: PathBuf,
+    found: Option<PathBuf>,
 }
 
 fn locate(project: &Path, entry: Option<&Path>) -> Result<Located> {
@@ -257,16 +339,43 @@ fn locate(project: &Path, entry: Option<&Path>) -> Result<Located> {
         "entry file {} does not exist",
         entry.display()
     );
-    let hash = input_hash(&project, &entry)?;
     let root = cache_dir().join("remotion");
-    let dir = root.join(&hash);
+    let linked = !hash_all() && cache::links_work(&root);
+    let key = input_hash(&project, &entry, !linked)?;
+    let found = if linked {
+        find_linked(&root, &key, &project)
+    } else {
+        Some(root.join(&key)).filter(|dir| dir.join("index.html").is_file())
+    };
     Ok(Located {
         project,
         entry,
-        hash,
+        key,
+        linked,
         root,
-        dir,
+        found,
     })
+}
+
+type Remembered = (PathBuf, Option<PathBuf>, Located);
+
+static REMEMBERED: Mutex<Option<Remembered>> = Mutex::new(None);
+
+fn locate_once(project: &Path, entry: Option<&Path>) -> Result<Located> {
+    let remembered = REMEMBERED.lock().unwrap().take();
+    match remembered {
+        Some((known_project, known_entry, located))
+            if known_project == project
+                && known_entry.as_deref() == entry
+                && located
+                    .found
+                    .as_ref()
+                    .is_none_or(|dir| dir.join("index.html").is_file()) =>
+        {
+            Ok(located)
+        }
+        _ => locate(project, entry),
+    }
 }
 
 fn webgl_mark(bundle: &Path, composition: &str) -> PathBuf {
@@ -282,50 +391,119 @@ fn remember_webgl(bundle: &Path, composition: &str) {
 /// Whether an earlier render of this composition found that its page uses WebGL. The answer
 /// is kept beside the bundle, so it is known before CEF starts and the render can begin on
 /// SwiftShader instead of aborting on the GPU first.
+///
+/// The lookup is reused by the next [`bundle`] of the same project in this process, so a
+/// one-shot render looks at the project's files once.
 pub fn known_webgl(project: &Path, entry: Option<&Path>, composition: &str) -> bool {
-    locate(project, entry).is_ok_and(|found| webgl_mark(&found.dir, composition).is_file())
+    let Ok(located) = locate(project, entry) else {
+        return false;
+    };
+    let known = located
+        .found
+        .as_ref()
+        .is_some_and(|dir| webgl_mark(dir, composition).is_file());
+    *REMEMBERED.lock().unwrap() = Some((project.to_owned(), entry.map(Path::to_owned), located));
+    known
 }
 
 /// Bundles the project with its own `@remotion/bundler` in a Node subprocess. The result is
-/// cached under `VRF_CACHE_DIR` (default: the system temp dir) by a hash of the project's files,
-/// the entry, the bundler version and the bundling script.
+/// cached under `VRF_CACHE_DIR` (default: the system temp dir).
+///
+/// The bundle's `public` is a link to the project's `public` (a junction on Windows), so the
+/// assets are served in place and never copied. A bundle is reused while the entry, the bundler
+/// version, the bundling script, the root package and lock files and every file webpack read
+/// for it keep their size and modification time; assets in `public` do not count.
+///
+/// `VRF_HASH_ALL=1`, or a cache on a volume without links such as exFAT, keeps the earlier
+/// behaviour: the cache key covers every file of the project and `public` is copied into the
+/// bundle.
 pub fn bundle(project: &Path, entry: Option<&Path>) -> Result<Bundle> {
     let Located {
         project,
         entry,
-        hash,
+        key,
+        linked,
         root,
-        dir,
-    } = locate(project, entry)?;
-    if dir.join("index.html").is_file() {
+        found,
+    } = locate_once(project, entry)?;
+    if let Some(dir) = found {
+        cache::touch(&dir);
         return Ok(Bundle { dir, cached: true });
     }
     fs::create_dir_all(&root)?;
     let script = root.join("remotion-bundle.mjs");
     write_if_changed(&script, BUNDLE_JS)?;
-    let partial = partial_path(&root, &hash);
-    let _ = fs::remove_dir_all(&partial);
-    let output = Command::new("node")
-        .arg(&script)
-        .arg(&project)
-        .arg(&entry)
-        .arg(&partial)
+    let partial = partial_path(&root, &key);
+    let _ = cache::remove(&partial);
+    let mut command = Command::new("node");
+    command.arg(&script).arg(&project).arg(&entry).arg(&partial);
+    if linked {
+        let empty = root.join(EMPTY_PUBLIC);
+        fs::create_dir_all(&empty)?;
+        command.arg(&empty).arg(partial.join(INPUTS));
+    }
+    let started = SystemTime::now();
+    let output = command
         .output()
+        .inspect_err(|_| {
+            let _ = cache::remove(&partial);
+        })
         .context("run node to bundle the project")?;
-    ensure!(
-        output.status.success(),
-        "bundling {} failed:\n{}",
-        entry.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if !output.status.success() {
+        let _ = cache::remove(&partial);
+        anyhow::bail!(
+            "bundling {} failed:\n{}",
+            entry.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let dir = if linked {
+        let public = project.join("public");
+        let bundled = partial.join("public");
+        let linked_in = cache::remove(&bundled).and_then(|()| {
+            if public.is_dir() {
+                cache::link_dir(&public, &bundled)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = linked_in {
+            let _ = cache::remove(&partial);
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot link {} into the bundle; VRF_HASH_ALL=1 copies it instead",
+                    public.display()
+                )
+            });
+        }
+        let files = read_inputs(&partial)?;
+        if changed_since(&files, started) {
+            return Ok(Bundle {
+                dir: partial,
+                cached: false,
+            });
+        }
+        root.join(format!("{key}-{}", input_state(&key, &project, &files)))
+    } else {
+        root.join(&key)
+    };
     if let Err(error) = fs::rename(&partial, &dir) {
         ensure!(
             dir.join("index.html").is_file(),
             "cannot move the bundle into place: {error}"
         );
-        let _ = fs::remove_dir_all(&partial);
+        let _ = cache::remove(&partial);
     }
+    cache::touch(&dir);
     Ok(Bundle { dir, cached: false })
+}
+
+fn prune_bundles(held: &[PathBuf]) {
+    let keep = cache::keep();
+    if keep == 0 {
+        return;
+    }
+    let _ = cache::prune(&cache_dir().join("remotion"), keep, held, is_bundle_name);
 }
 
 /// Remotion's own frame server for `<OffthreadVideo>`, run by the project's `@remotion/renderer`
@@ -778,6 +956,15 @@ impl Renderer {
 
         let step = Instant::now();
         let bundle = bundle(&options.project, options.entry.as_deref())?;
+        if !bundle.cached {
+            let held: Vec<PathBuf> = self
+                .loaded
+                .iter()
+                .map(|loaded| loaded.key.bundle.clone())
+                .chain([bundle.dir.clone()])
+                .collect();
+            prune_bundles(&held);
+        }
         let bundle_s = step.elapsed();
 
         let project_dir = crate::canonical(&options.project)?;
@@ -1045,17 +1232,98 @@ mod tests {
         fs::create_dir_all(project.join("src"))?;
         fs::write(bundler.join("package.json"), "{}")?;
         fs::write(project.join("src/index.ts"), "")?;
-        let found = locate(&project, None)?;
-        fs::create_dir_all(&found.dir)?;
+        let dir = fake_bundle(&project, &[project.join("src/index.ts")])?;
         assert!(!known_webgl(&project, None, "Shader"));
-        remember_webgl(&found.dir, "Shader");
+        remember_webgl(&dir, "Shader");
         assert!(known_webgl(&project, None, "Shader"));
         assert!(!known_webgl(&project, None, "Other"));
         fs::write(project.join("src/index.ts"), "changed")?;
         assert!(!known_webgl(&project, None, "Shader"));
-        fs::remove_dir_all(&found.dir)?;
+        cache::remove(&dir)?;
         fs::remove_dir_all(&project)?;
         Ok(())
+    }
+
+    fn fake_project(name: &str) -> Result<PathBuf> {
+        let project = std::env::temp_dir().join(format!("vrf-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&project);
+        let bundler = project.join("node_modules/@remotion/bundler");
+        fs::create_dir_all(&bundler)?;
+        fs::create_dir_all(project.join("src"))?;
+        fs::create_dir_all(project.join("public/v"))?;
+        fs::write(bundler.join("package.json"), "{}")?;
+        fs::write(project.join("src/index.ts"), "")?;
+        fs::write(project.join("public/v/clip.mp4"), "clip")?;
+        Ok(crate::canonical(&project)?)
+    }
+
+    fn fake_bundle(project: &Path, files: &[PathBuf]) -> Result<PathBuf> {
+        let located = locate(project, None)?;
+        let name = format!(
+            "{}-{}",
+            located.key,
+            input_state(&located.key, &located.project, files)
+        );
+        let dir = located.root.join(name);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("index.html"), "")?;
+        fs::write(dir.join(INPUTS), serde_json::to_vec(files)?)?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn a_bundle_is_found_again_until_a_file_webpack_read_changes() -> Result<()> {
+        let project = fake_project("find")?;
+        let source = project.join("src/index.ts");
+        let data = project.join("samples/demo.json");
+        fs::create_dir_all(data.parent().unwrap())?;
+        fs::write(&data, "{}")?;
+        let dir = fake_bundle(&project, &[data.clone(), source.clone()])?;
+        assert_eq!(locate(&project, None)?.found.as_ref(), Some(&dir));
+        fs::write(project.join("public/v/clip.mp4"), "a longer clip")?;
+        fs::write(project.join("public/new.png"), "png")?;
+        fs::create_dir_all(project.join("work"))?;
+        fs::write(project.join("work/props.json"), "{}")?;
+        fs::write(project.join("render.mp4"), "out")?;
+        assert_eq!(locate(&project, None)?.found.as_ref(), Some(&dir));
+        fs::write(&data, "{\"changed\":true}")?;
+        assert_eq!(locate(&project, None)?.found, None);
+        fs::write(&data, "{}")?;
+        let again = fake_bundle(&project, &[data.clone(), source.clone()])?;
+        fs::write(project.join("package.json"), "{}")?;
+        assert_eq!(locate(&project, None)?.found, None);
+        cache::remove(&dir)?;
+        cache::remove(&again)?;
+        fs::remove_dir_all(&project)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hashing_every_file_still_sees_public() -> Result<()> {
+        let project = fake_project("all")?;
+        let key = |project: &Path| input_hash(project, &project.join("src/index.ts"), true);
+        let before = key(&project)?;
+        fs::write(project.join("public/v/clip.mp4"), "a longer clip")?;
+        assert_ne!(before, key(&project)?);
+        let linked = |project: &Path| input_hash(project, &project.join("src/index.ts"), false);
+        let before = linked(&project)?;
+        fs::write(project.join("public/v/clip.mp4"), "an even longer clip")?;
+        fs::write(project.join("src/index.ts"), "changed")?;
+        assert_eq!(before, linked(&project)?);
+        fs::remove_dir_all(&project)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_names_are_hashes_and_nothing_else() {
+        assert!(is_bundle_name("0123456789abcdef"));
+        assert!(is_bundle_name("0123456789abcdef-fedcba9876543210"));
+        assert!(!is_bundle_name("0123456789abcdef.partial-1-0"));
+        assert!(!is_bundle_name("empty-public"));
+        assert!(!is_bundle_name("remotion-bundle.mjs"));
+        assert!(!is_bundle_name(
+            "0123456789abcdef-fedcba9876543210-0123456789abcdef"
+        ));
     }
 
     #[test]
