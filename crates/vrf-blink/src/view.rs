@@ -24,6 +24,32 @@ use crate::video::{self, INIT, Pusher};
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 const EVALUATE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_PAGE_TIMEOUT_MS: u64 = 30_000;
+static PAGE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(DEFAULT_PAGE_TIMEOUT_MS);
+
+/// Lets the host's waits on pages follow the page's own timeout (`--timeout`), so that a page
+/// given more time to settle a frame is not abandoned by the host first: a page load waits at
+/// least the page timeout, and a DevTools call twice it plus 10 s (a seek waits on two barriers of
+/// the page timeout + 3 s each). The waits never drop below their defaults (30 s and 60 s; 70 s
+/// for a DevTools call at the default 30 s page timeout). Process-wide: the last page set wins.
+pub fn set_page_timeout(timeout: Duration) {
+    PAGE_TIMEOUT_MS.store(
+        (timeout.as_millis() as u64).max(1),
+        Ordering::Relaxed,
+    );
+}
+
+fn page_timeout() -> Duration {
+    Duration::from_millis(PAGE_TIMEOUT_MS.load(Ordering::Relaxed))
+}
+
+fn load_timeout() -> Duration {
+    LOAD_TIMEOUT.max(page_timeout())
+}
+
+fn evaluate_timeout() -> Duration {
+    EVALUATE_TIMEOUT.max(page_timeout() * 2 + Duration::from_secs(10))
+}
 const SETTLE_FIRST_DELIVERY: Duration = Duration::from_secs(5);
 const SETTLE_DELIVERY: Duration = Duration::from_secs(1);
 /// On Windows the first begin frame after a resize is answered only once the next one arrives.
@@ -534,7 +560,7 @@ impl View {
             closing: false,
         };
         loaded
-            .recv_timeout(LOAD_TIMEOUT)
+            .recv_timeout(load_timeout())
             .context("the page did not finish loading")?;
         if view.ticking {
             view.evaluate(
@@ -555,7 +581,8 @@ impl View {
         let (width, height) = self.size.pixels();
         let started = Instant::now();
         let (mut clean, mut missed, mut rounds) = (0, 0, 0);
-        while started.elapsed() < LOAD_TIMEOUT {
+        let limit = load_timeout();
+        while started.elapsed() < limit {
             if !self.ticking {
                 self.invalidate();
             }
@@ -659,7 +686,7 @@ impl View {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        self.execute_within(EVALUATE_TIMEOUT, method, params)
+        self.execute_within(evaluate_timeout(), method, params)
     }
 
     fn execute_within(
@@ -745,5 +772,24 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn host_waits_follow_the_page_timeout_and_never_drop_below_their_defaults() {
+        set_page_timeout(Duration::from_secs(30));
+        assert_eq!(load_timeout(), Duration::from_secs(30));
+        assert_eq!(evaluate_timeout(), Duration::from_secs(70));
+        set_page_timeout(Duration::from_secs(120));
+        assert_eq!(load_timeout(), Duration::from_secs(120));
+        assert_eq!(evaluate_timeout(), Duration::from_secs(250));
+        set_page_timeout(Duration::from_secs(5));
+        assert_eq!(load_timeout(), LOAD_TIMEOUT);
+        assert_eq!(evaluate_timeout(), EVALUATE_TIMEOUT);
+        set_page_timeout(Duration::from_millis(DEFAULT_PAGE_TIMEOUT_MS));
     }
 }

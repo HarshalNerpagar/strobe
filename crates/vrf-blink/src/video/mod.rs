@@ -11,6 +11,6 @@ mod stream;
 pub use decoder::set_hardware_decoding;
 pub use decoder::{Clip, Frame, Matrix, Reader};
 pub use hyperframes::NativeVideos;
-pub use link::{Clips, Link, Pusher, Resolve, StartFallback};
+pub use link::{Clips, Handoff, Link, Pusher, Resolve, StartFallback};
 pub(crate) use renderer::{INIT, PAGE, PUSH, VideoRenderHandler};
 pub use stream::Stream;

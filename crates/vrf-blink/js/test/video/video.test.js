@@ -338,3 +338,16 @@ test('an aborted request does not stop a later request for the same frame', asyn
     assert.equal(res.status, 200);
   });
 });
+
+test('a frame request handed to the frame server is reported to the host', () => {
+  const sent = [];
+  const saved = globalThis.__vrf_video_send;
+  globalThis.__vrf_video_send = (json) => sent.push(JSON.parse(json));
+  try {
+    globalThis.__vrf.video.fellBack('vrf://project/public/slow.mp4', 'no native frame within 15000 ms');
+  } finally {
+    globalThis.__vrf_video_send = saved;
+  }
+  assert.deepEqual(sent, [{ t: 'handoff', src: 'vrf://project/public/slow.mp4', reason: 'no native frame within 15000 ms' }]);
+  assert.match(globalThis.__vrf.video.diagnose(), /sent to the frame server: slow\.mp4: no native frame within 15000 ms/);
+});

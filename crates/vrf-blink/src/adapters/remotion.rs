@@ -227,8 +227,33 @@ pub struct Report {
     pub output_width: u32,
     #[serde(default)]
     pub output_height: u32,
+    /// Native frame requests the page handed to the frame server (too slow or failed), by clip.
+    #[serde(default)]
+    pub native: NativeVideo,
     #[serde(skip)]
     pub assets: Vec<FrameAssets>,
+}
+
+/// What the native video path had to give to the frame server during one render.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct NativeVideo {
+    pub handoffs: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoff_clips: Vec<crate::video::Handoff>,
+}
+
+impl NativeVideo {
+    fn of(page: &Page) -> NativeVideo {
+        let handoff_clips = page
+            .native
+            .as_ref()
+            .map(|native| native.clips.take_handoffs())
+            .unwrap_or_default();
+        NativeVideo {
+            handoffs: handoff_clips.iter().map(|clip| clip.requests).sum(),
+            handoff_clips,
+        }
+    }
 }
 
 /// The error of a render whose page creates a WebGL context while CEF runs WebGL on the GPU.
@@ -573,6 +598,12 @@ pub struct Offthread {
 
 const FRAME_SERVER_START: Duration = Duration::from_secs(30);
 
+/// Decode threads for the frame server: a quarter of the logical CPUs, 2 to 4 (4 on the
+/// 16-thread production PC, one per view at the views policy above 1080p).
+fn frame_server_threads() -> usize {
+    thread::available_parallelism().map_or(2, |n| (n.get() / 4).clamp(2, 4))
+}
+
 fn first_line(stdout: impl std::io::Read + Send + 'static, timeout: Duration) -> Result<String> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -598,6 +629,7 @@ impl Offthread {
             .arg(&script)
             .arg(project)
             .arg(bundle_dir)
+            .arg(frame_server_threads().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -703,6 +735,7 @@ pub struct Page {
 
 impl Page {
     pub fn new(project: Project, options: &Options, frames: Option<&Offthread>) -> Result<Page> {
+        crate::set_page_timeout(options.timeout);
         let port = frames.map_or(0, |server| server.port);
         project.allow_direct(format!("http://localhost:{port}/"));
         let config = json!({
@@ -1148,6 +1181,10 @@ impl Renderer {
             }
         };
         let frame_server_s = step.elapsed();
+        crate::set_page_timeout(loaded.key.timeout);
+        if let Some(native) = &loaded.page.native {
+            native.clips.take_handoffs();
+        }
         loaded.page.project.clear_failures();
         Ok(Taken {
             loaded,
@@ -1481,6 +1518,7 @@ impl Renderer {
         muxer.finish()?;
         let finish_s = step.elapsed();
 
+        let native = NativeVideo::of(&loaded.page);
         self.keep(loaded);
 
         let elapsed = started.elapsed();
@@ -1527,6 +1565,7 @@ impl Renderer {
             seek_retries: seek_retries.into_inner(),
             output_width,
             output_height,
+            native,
             assets: collected,
         })
     }

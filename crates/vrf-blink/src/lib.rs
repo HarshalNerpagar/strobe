@@ -24,7 +24,7 @@ mod win;
 pub(crate) use app::webgl_settled;
 pub use app::{OnUi, Ui, cpu_raster, run, set_cpu_raster, set_software_webgl, software_webgl};
 pub use scheme::{Mode, Project};
-pub use view::{Paint, View};
+pub use view::{Paint, View, set_page_timeout};
 
 pub(crate) fn canonical(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     let path = path.canonicalize()?;

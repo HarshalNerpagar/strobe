@@ -349,8 +349,12 @@
     });
   };
 
+  // Frame requests the page's fetch shim handed to the frame server; the host counts them for the render report.
   const fallbacks = new Map();
-  const fellBack = (src, reason) => fallbacks.set(src, reason);
+  const fellBack = (src, reason) => {
+    fallbacks.set(src, reason);
+    send({ t: 'handoff', src, reason });
+  };
 
   const inFlight = new Map();
   let nextFlight = 1;

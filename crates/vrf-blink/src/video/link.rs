@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
@@ -6,7 +6,7 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use cef::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::PUSH;
@@ -100,6 +100,16 @@ impl Pusher {
 #[derive(Default)]
 pub struct Clips {
     opened: Mutex<HashMap<PathBuf, Arc<Clip>>>,
+    handoffs: Mutex<BTreeMap<String, Handoff>>,
+}
+
+/// Frame requests of one clip that the page handed to the frame server: the native request was
+/// too slow or failed. `reason` is the last one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Handoff {
+    pub src: String,
+    pub requests: u64,
+    pub reason: String,
 }
 
 impl Clips {
@@ -111,6 +121,24 @@ impl Clips {
         let clip = Arc::new(Clip::open(path)?);
         opened.insert(path.to_owned(), clip.clone());
         Ok(clip)
+    }
+
+    fn note_handoff(&self, src: String, reason: String) {
+        let mut handoffs = self.handoffs.lock().unwrap();
+        let entry = handoffs.entry(src.clone()).or_insert(Handoff {
+            src,
+            requests: 0,
+            reason: String::new(),
+        });
+        entry.requests += 1;
+        entry.reason = reason;
+    }
+
+    /// The handoffs since the last call, by clip, and forgets them.
+    pub fn take_handoffs(&self) -> Vec<Handoff> {
+        std::mem::take(&mut *self.handoffs.lock().unwrap())
+            .into_values()
+            .collect()
     }
 }
 
@@ -125,6 +153,7 @@ pub type Resolve = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
 enum Message {
     Open(Open),
     Want { clip: u32, k: usize, hit: bool },
+    Handoff { src: String, reason: String },
 }
 
 #[derive(Deserialize)]
@@ -212,6 +241,10 @@ fn serve(
                     Some(playing) => want(&pusher, clip, playing, k, hit),
                     None => Ok(()),
                 },
+                Message::Handoff { src, reason } => {
+                    clips.note_handoff(src, reason);
+                    Ok(())
+                }
             });
         if let Err(error) = result {
             eprintln!("video: {error:#}");
@@ -400,4 +433,32 @@ fn want(pusher: &Pusher, id: u32, playing: &mut Playing, k: usize, hit: bool) ->
         .pushed
         .retain(|index| *index + KEEP_BEHIND >= k && *index <= k + KEEP_AHEAD);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoffs_are_counted_by_clip_and_taken_once() {
+        let clips = Clips::default();
+        clips.note_handoff("vrf://project/public/a.mp4".into(), "slow".into());
+        clips.note_handoff("vrf://project/public/b.mp4".into(), "failed".into());
+        clips.note_handoff("vrf://project/public/a.mp4".into(), "no native frame".into());
+        let taken = clips.take_handoffs();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].src, "vrf://project/public/a.mp4");
+        assert_eq!((taken[0].requests, taken[0].reason.as_str()), (2, "no native frame"));
+        assert_eq!(taken[1].requests, 1);
+        assert!(clips.take_handoffs().is_empty());
+    }
+
+    #[test]
+    fn the_page_handoff_message_is_understood() {
+        let message: Message = serde_json::from_str(
+            r#"{"t":"handoff","src":"vrf://project/public/a.mp4","reason":"no native frame within 15000 ms"}"#,
+        )
+        .unwrap();
+        assert!(matches!(message, Message::Handoff { ref src, .. } if src.ends_with("a.mp4")));
+    }
 }
