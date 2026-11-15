@@ -28,23 +28,57 @@ globalThis.process.env.NODE_ENV = 'production';
   if (config.serveUrl || config.nativeVideo) {
     const nativeFetch = globalThis.fetch.bind(globalThis);
     const proxy = /^http:\/\/localhost:\d+\/proxy\?/;
+    // A native frame request still unanswered after half the page timeout is asked of the frame server instead (when one
+    // runs), so that a reply that never reaches the page does not fail the frame. Remotion fails a frame whose request is
+    // still open after its delayRender() timeout (28 s by default).
+    const patience = Math.max(1000, Math.floor(config.timeoutInMilliseconds / 2));
+    const SLOW = Symbol('slow');
+    const withPatience = (promise) =>
+      new Promise((resolve, reject) => {
+        const timer = nativeSetTimeout(() => resolve(SLOW), patience);
+        promise.then(
+          (value) => {
+            nativeClearTimeout(timer);
+            resolve(value);
+          },
+          (error) => {
+            nativeClearTimeout(timer);
+            reject(error);
+          },
+        );
+      });
     globalThis.fetch = async (input, init) => {
       const href = typeof input === 'string' ? input : input instanceof URL ? input.href : null;
       if (href !== null && proxy.test(href)) {
         const url = new URL(href);
         const time = Math.max(0, Number(url.searchParams.get('time')));
         url.searchParams.set('time', String(time));
-        let { serveUrl } = config;
-        if (config.nativeVideo) {
-          // The URL's port is Remotion's window.remotion_proxyPort, 0 while no frame server runs: this branch answers it.
-          const response = await globalThis.__vrf.video.request(url.searchParams.get('src'), time, init?.signal);
-          if (response) return response;
-          const fallback = globalThis.__vrf.video.fallback();
-          if (!fallback) throw new Error(`cannot decode ${url.searchParams.get('src')}: ${globalThis.__vrf.video.refusal()}`);
-          url.port = String(fallback.port);
-          serveUrl = fallback.serveUrl;
-        }
         const src = url.searchParams.get('src');
+        let { serveUrl } = config;
+        const video = globalThis.__vrf.video;
+        // The frame server started with the page when config.proxyPort is set; Remotion built the URL with that port.
+        const server = config.proxyPort > 0 && config.serveUrl;
+        if (config.nativeVideo) {
+          let response;
+          try {
+            response = await (server ? withPatience(video.request(src, time, init?.signal)) : video.request(src, time, init?.signal));
+            if (response === SLOW) video.fellBack(src, `no native frame within ${patience} ms`);
+          } catch (error) {
+            if (init?.signal?.aborted || !server) throw error;
+            video.fellBack(src, `native request failed: ${error?.message ?? error}`);
+            response = SLOW;
+          }
+          if (response === SLOW) {
+            // the frame server answers this one request; the next frame of the clip is asked natively again
+          } else if (response) {
+            return response;
+          } else if (!server) {
+            const fallback = video.fallback();
+            if (!fallback) throw new Error(`cannot decode ${src}: ${video.refusal()}`);
+            url.port = String(fallback.port);
+            serveUrl = fallback.serveUrl;
+          }
+        }
         if (src?.startsWith(`${location.origin}/`)) url.searchParams.set('src', serveUrl + src.slice(location.origin.length));
         input = url.toString();
       }

@@ -234,6 +234,13 @@ impl Ui {
         );
     }
 
+    /// Like [`Ui::post`], but gives `false` instead of panicking once CEF has shut down, for
+    /// threads that may outlive the render, such as a decoder pushing a late frame.
+    pub fn try_post(&self, job: impl FnOnce() + Send + 'static) -> bool {
+        let mut task = UiTask::new(Arc::new(Mutex::new(Some(Box::new(job)))));
+        post_task(ThreadId::UI, Some(&mut task)) == 1
+    }
+
     pub fn call<R: Send + 'static>(&self, job: impl FnOnce() -> R + Send + 'static) -> R {
         let (sender, receiver) = mpsc::sync_channel(1);
         self.post(move || {

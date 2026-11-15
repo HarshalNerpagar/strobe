@@ -349,6 +349,9 @@
     });
   };
 
+  const fallbacks = new Map();
+  const fellBack = (src, reason) => fallbacks.set(src, reason);
+
   const inFlight = new Map();
   let nextFlight = 1;
 
@@ -388,8 +391,11 @@
       const name = decodeURIComponent(String(src).split('/').pop());
       return `${name} t=${time}${k === null ? ' (opening)' : ` frame ${k}`} for ${Math.round(now - since)} ms`;
     });
-    const fallback = fallbackInfo ? `frame server on port ${fallbackInfo.port}` : 'frame server not started';
-    return `strobe native video: ${waiting.length} request(s) in flight${waiting.length ? ` [${waiting.slice(0, 4).join('; ')}]` : ''}, ${abortedRequests} aborted, ${fallback}${lastRefusal ? `, last refusal: ${lastRefusal}` : ''}`;
+    const config = globalThis.__vrf_rm_config ?? {};
+    const port = fallbackInfo?.port ?? (config.proxyPort > 0 ? config.proxyPort : null);
+    const fallback = port ? `frame server on port ${port}` : 'frame server not started';
+    const moved = [...fallbacks].map(([src, reason]) => `${decodeURIComponent(String(src).split('/').pop())}: ${reason}`);
+    return `strobe native video: ${waiting.length} request(s) in flight${waiting.length ? ` [${waiting.slice(0, 4).join('; ')}]` : ''}, ${abortedRequests} aborted, ${fallback}${moved.length ? `, sent to the frame server: ${moved.slice(0, 4).join('; ')}` : ''}${lastRefusal ? `, last refusal: ${lastRefusal}` : ''}`;
   };
 
   const present = () => {
@@ -430,6 +436,8 @@
     refusal: () => lastRefusal,
     diagnose,
     inFlight,
+    fellBack,
+    fallbacks,
     chooseFrame,
     chooseFrameAtOrBefore,
     frameRule,

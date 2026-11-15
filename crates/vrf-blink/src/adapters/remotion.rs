@@ -632,11 +632,13 @@ impl Drop for Offthread {
     }
 }
 
-/// Remotion's frame server, started on first use for the clips the native path refuses.
+/// Remotion's frame server for the clips the native path refuses: the one started with the page,
+/// or else one started on first use.
 pub struct Fallback {
     project_dir: PathBuf,
     bundle_dir: PathBuf,
     project: Project,
+    running: Option<(u16, String)>,
     server: Mutex<Option<Offthread>>,
 }
 
@@ -646,11 +648,21 @@ impl Fallback {
             project_dir: crate::canonical(&project_dir)?,
             bundle_dir: bundle_dir.to_owned(),
             project,
+            running: None,
             server: Mutex::new(None),
         })
     }
 
+    /// Answers with `server`, which runs for as long as the page, instead of starting another.
+    pub fn with_running(mut self, server: Option<&Offthread>) -> Fallback {
+        self.running = server.map(|server| (server.port, server.serve_url.clone()));
+        self
+    }
+
     fn port_and_url(&self) -> Result<(u16, String)> {
+        if let Some(running) = &self.running {
+            return Ok(running.clone());
+        }
         let mut server = self.server.lock().unwrap();
         if server.is_none() {
             let started = Offthread::start(&self.project_dir, &self.bundle_dir)?;
@@ -662,7 +674,7 @@ impl Fallback {
         Ok((server.port, server.serve_url.clone()))
     }
 
-    /// Whether the frame server had to be started.
+    /// Whether a frame server had to be started on first use.
     pub fn started(&self) -> bool {
         self.server.lock().unwrap().is_some()
     }
@@ -1107,13 +1119,23 @@ impl Renderer {
             Some(loaded) => loaded,
             None => {
                 let project = Project::open(&bundle.dir, options.mode)?;
+                // The native path starts the frame server too, so that the page's frame URLs carry a
+                // real port and a native request that fails or is slow can be answered by it. If it
+                // cannot start, native rendering goes on and the server is tried again on first use.
                 let frame_server = match options.video {
                     VideoDecoder::Remotion => Some(Offthread::start(&key.project, &bundle.dir)?),
-                    VideoDecoder::Native => None,
+                    VideoDecoder::Native => Offthread::start(&key.project, &bundle.dir)
+                        .inspect_err(|error| {
+                            eprintln!(
+                                "warning: the frame server did not start with the page: {error:#}"
+                            )
+                        })
+                        .ok(),
                 };
                 let mut page = Page::new(project.clone(), options, frame_server.as_ref())?;
                 if options.video == VideoDecoder::Native {
-                    let fallback = Fallback::new(&key.project, &bundle.dir, project)?;
+                    let fallback = Fallback::new(&key.project, &bundle.dir, project)?
+                        .with_running(frame_server.as_ref());
                     page = page.with_native_video(Arc::new(fallback));
                 }
                 Loaded {

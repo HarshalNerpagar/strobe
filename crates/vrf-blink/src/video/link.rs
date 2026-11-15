@@ -43,12 +43,13 @@ impl Pusher {
         fill(unsafe { std::slice::from_raw_parts_mut(builder.memory().cast::<u8>(), len) });
         let message = OnUi(builder.build().context("no shared message")?);
         let host = self.host.clone();
-        self.ui.post(move || {
+        let posted = self.ui.try_post(move || {
             let mut message = message.0;
             if let Some(frame) = host.0.browser().and_then(|browser| browser.main_frame()) {
                 frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
             }
         });
+        anyhow::ensure!(posted, "the browser has shut down");
         Ok(())
     }
 
