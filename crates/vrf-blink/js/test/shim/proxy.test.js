@@ -105,3 +105,13 @@ test('without a frame server the native path waits as before and a refusal uses 
   assert.equal(url.port, '5555');
   assert.equal(url.searchParams.get('src'), 'http://localhost:5600/public/a.mp4');
 });
+
+test('a long page timeout still hands a slow native request to the frame server after 15 s at most', async () => {
+  const page = load({ request: () => new Promise(() => {}), config: { ...withServer, timeoutInMilliseconds: 120000 } });
+  const started = Date.now();
+  const pending = page.fetch(frameUrl(4321));
+  const outcome = await Promise.race([pending.then(() => 'answered'), new Promise((r) => setTimeout(() => r('waiting'), 16000))]);
+  assert.equal(outcome, 'answered');
+  assert.ok(Date.now() - started >= 14900);
+  assert.match(page.fellBack[0][1], /no native frame within 15000 ms/);
+});

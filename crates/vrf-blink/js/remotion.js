@@ -28,10 +28,11 @@ globalThis.process.env.NODE_ENV = 'production';
   if (config.serveUrl || config.nativeVideo) {
     const nativeFetch = globalThis.fetch.bind(globalThis);
     const proxy = /^http:\/\/localhost:\d+\/proxy\?/;
-    // A native frame request still unanswered after half the page timeout is asked of the frame server instead (when one
-    // runs), so that a reply that never reaches the page does not fail the frame. Remotion fails a frame whose request is
-    // still open after its delayRender() timeout (28 s by default).
-    const patience = Math.max(1000, Math.floor(config.timeoutInMilliseconds / 2));
+    // A native frame request still unanswered after half the page timeout, but never more than 15 s, is asked of the frame
+    // server instead (when one runs). Remotion fails a frame whose request is still open after its delayRender() timeout
+    // (page timeout - 2 s). The cap keeps a long --timeout from delaying the handoff: under CPU load (2026-11-15, 24 busy
+    // processes) handing off at 15 s rendered v6.2 with a 30 s timeout, while 60 s (half of 120 s) left one frame open.
+    const patience = Math.max(1000, Math.min(15000, Math.floor(config.timeoutInMilliseconds / 2)));
     const SLOW = Symbol('slow');
     const withPatience = (promise) =>
       new Promise((resolve, reject) => {
@@ -186,7 +187,7 @@ globalThis.process.env.NODE_ENV = 'production';
       const timer = nativeSetTimeout(() => {
         const where = frame === null ? '' : ` at frame ${frame}`;
         const handles = openHandles();
-        done(reject, new Error(`Timeout exceeded rendering the component${where}. ${handles ? `Open delayRender() handles: ${handles}` : ''}`));
+        done(reject, new Error(withVideoState(`Timeout exceeded rendering the component${where}. ${handles ? `Open delayRender() handles: ${handles}` : ''}`)));
       }, config.timeoutInMilliseconds + 3000);
       const check = async () => {
         if (pageErrors.length) return done(reject, new Error(withVideoState(pageErrors.shift())));
