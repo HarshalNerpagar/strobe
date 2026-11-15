@@ -33,10 +33,7 @@ static PAGE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(DEFAULT_PAGE_TIMEOUT_MS);
 /// the page timeout + 3 s each). The waits never drop below their defaults (30 s and 60 s; 70 s
 /// for a DevTools call at the default 30 s page timeout). Process-wide: the last page set wins.
 pub fn set_page_timeout(timeout: Duration) {
-    PAGE_TIMEOUT_MS.store(
-        (timeout.as_millis() as u64).max(1),
-        Ordering::Relaxed,
-    );
+    PAGE_TIMEOUT_MS.store((timeout.as_millis() as u64).max(1), Ordering::Relaxed);
 }
 
 fn page_timeout() -> Duration {

@@ -444,11 +444,17 @@ mod tests {
         let clips = Clips::default();
         clips.note_handoff("vrf://project/public/a.mp4".into(), "slow".into());
         clips.note_handoff("vrf://project/public/b.mp4".into(), "failed".into());
-        clips.note_handoff("vrf://project/public/a.mp4".into(), "no native frame".into());
+        clips.note_handoff(
+            "vrf://project/public/a.mp4".into(),
+            "no native frame".into(),
+        );
         let taken = clips.take_handoffs();
         assert_eq!(taken.len(), 2);
         assert_eq!(taken[0].src, "vrf://project/public/a.mp4");
-        assert_eq!((taken[0].requests, taken[0].reason.as_str()), (2, "no native frame"));
+        assert_eq!(
+            (taken[0].requests, taken[0].reason.as_str()),
+            (2, "no native frame")
+        );
         assert_eq!(taken[1].requests, 1);
         assert!(clips.take_handoffs().is_empty());
     }
